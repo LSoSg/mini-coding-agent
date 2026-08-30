@@ -1,6 +1,7 @@
 .env
 .env.*
 __pycache__/
+.pytest_cache/
 *.pyc
 
 .vscode/
@@ -11,5 +12,8 @@ venv/
 
 logs/
 tmp/
+
+/workspace/*
+!/workspace/.gitkeep
 
 .DS_Store
