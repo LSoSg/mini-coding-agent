@@ -1,76 +1,52 @@
-"""Minimal tool-calling agent with verification-aware termination."""
+"""Plan-constrained coding-agent loop for v0.4."""
+
+from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
+from planning import (
+    MAX_PLAN_COMPLETION_REMINDERS,
+    MAX_PLANNING_ATTEMPTS,
+    MAX_REPLANS,
+    PLANNING_PROMPT,
+    PlanStepStatus,
+    PlanValidationError,
+    TaskPlan,
+    is_verification_command,
+    match_plan_step,
+    parse_plan,
+    plan_as_json,
+)
 from tool_schemas import TOOLS
 from tools import ToolResult, execute_tool
 
-
 MAX_STEPS = 20
 MAX_VERIFICATION_REQUESTS = 3
+MAX_TOOL_LOG_ARGUMENT_CHARS = 240
 
-SYSTEM_PROMPT = """You are a coding agent working only in the local workspace.
-Use the provided tools to inspect, create, and modify code. Inspect relevant files before changing them, and never assume file contents when a tool can provide the facts.
-Treat every ToolResult as authoritative. If a tool fails, use its error to correct the request or explain why the task cannot be completed.
-For code changes, run an applicable allowed test or execution command after the latest modification. Only claim completion after a real execute_command ToolResult shows successful verification. If verification fails, fix the problem and verify again.
-When finished, give a concise summary and state which verification command was run. Do not claim that tests passed unless the tool result actually succeeded.
-Commands must be passed as JSON arrays and must match the execute_command tool description exactly."""
+SYSTEM_PROMPT = """You are a coding agent operating inside a controlled workspace.
+An accepted structured plan is a hard execution contract. Follow its pending steps in
+order, use only the tool named by the current step, and obey every argument constraint.
+Do not inspect unrelated files or read every file merely to establish context. Each tool
+call must be an atomic action tied to the user's goal. If the plan no longer fits, do not
+improvise: a plan deviation will trigger a bounded replanning phase.
 
-MODIFICATION_TERMS = {
-    "create",
-    "implement",
-    "add",
-    "modify",
-    "update",
-    "change",
-    "fix",
-    "repair",
-    "refactor",
-    "rewrite",
-    "write",
-    "remove",
-    "delete",
-}
-VERIFICATION_TERMS = {
-    "test",
-    "tests",
-    "pytest",
-    "unittest",
-    "verify",
-    "validate",
-    "check",
-    "build",
-}
-INFORMATION_TERMS = {
-    "inspect",
-    "explain",
-    "describe",
-    "show",
-    "list",
-    "read",
-    "search",
-    "what",
-    "why",
-    "how",
-    "tell",
-}
-MODIFICATION_PHRASES = (
-    "创建",
-    "实现",
-    "添加",
-    "修改",
-    "更新",
-    "修复",
-    "重构",
-    "编写",
-    "删除",
-)
-VERIFICATION_PHRASES = ("测试", "验证", "检查", "构建", "运行测试")
-INFORMATION_PHRASES = ("查看", "列出", "读取", "搜索", "解释", "说明", "是什么", "为什么", "如何")
+Use only the supplied tools for local actions. Never claim that a file was changed or a
+command passed without a successful tool result. For tasks that create or modify files,
+finish with a real verification command such as `python -m pytest` or an allowed Python
+script. Return a concise final answer only after the accepted plan is complete.
+"""
+
+
+class LLMChatClient(Protocol):
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Sequence[dict[str, Any]] | None = None,
+    ) -> Any: ...
 
 
 class AgentStatus(str, Enum):
@@ -78,9 +54,10 @@ class AgentStatus(str, Enum):
     VERIFICATION_REQUIRED = "VERIFICATION_REQUIRED"
     MAX_STEPS_REACHED = "MAX_STEPS_REACHED"
     FATAL_ERROR = "FATAL_ERROR"
+    PLAN_FAILED = "PLAN_FAILED"
 
 
-@dataclass(frozen=True)
+@dataclass
 class VerificationEvidence:
     command: str
     success: bool
@@ -95,342 +72,506 @@ class AgentResult:
     status: AgentStatus
     final_answer: str
     verification_evidence: list[VerificationEvidence]
+    plan_history: list[TaskPlan]
     steps: int
     messages: list[dict[str, Any]]
     error: str | None = None
 
 
-class LLMChatClient(Protocol):
-    def chat(
-        self,
-        messages: Sequence[Mapping[str, Any]],
-        tools: Sequence[Mapping[str, Any]],
-    ) -> Any: ...
-
-
-class AgentProtocolError(RuntimeError):
-    """Raised when an assistant response cannot form a valid message history."""
-
-
-def _words(text: str) -> set[str]:
-    normalized = "".join(character if character.isalnum() else " " for character in text)
-    return set(normalized.casefold().split())
-
-
 def task_requires_verification(task: str) -> bool:
-    """Classify tasks with conservative, deterministic keyword rules."""
-    words = _words(task)
-    folded = task.casefold()
-    if words & (MODIFICATION_TERMS | VERIFICATION_TERMS):
-        return True
-    if any(term in task for term in MODIFICATION_PHRASES + VERIFICATION_PHRASES):
-        return True
-    if words & INFORMATION_TERMS:
-        return False
-    if any(term in task for term in INFORMATION_PHRASES):
-        return False
-    # Ambiguous tasks default to verification rather than unverified completion.
-    return True
+    """Conservatively identify tasks likely to change the workspace."""
+
+    lowered = task.lower()
+    change_terms = (
+        "create", "write", "modify", "update", "edit", "fix", "implement",
+        "add", "delete", "remove", "refactor", "生成", "创建", "编写",
+        "写一个", "修改", "更新", "修复", "实现", "增加", "添加", "删除", "重构",
+    )
+    return any(term in lowered for term in change_terms)
 
 
-def is_verification_command(command: Any) -> bool:
-    """Return whether an allowed command represents test or runtime evidence."""
-    if not isinstance(command, list) or any(
-        not isinstance(argument, str) for argument in command
-    ):
-        return False
-    if command in (["pytest"], ["python", "-m", "pytest"]):
-        return True
+def _assistant_message_to_dict(message: Any) -> dict[str, Any]:
+    if isinstance(message, dict):
+        result = dict(message)
+    else:
+        model_dump = getattr(message, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump(exclude_none=True)
+            if not isinstance(dumped, dict):
+                raise ValueError("Assistant message model_dump() did not return an object.")
+            result = dumped
+        else:
+            tool_calls = getattr(message, "tool_calls", None)
+            result = {
+                "role": getattr(message, "role", "assistant"),
+                "content": getattr(message, "content", None),
+            }
+            if tool_calls:
+                result["tool_calls"] = [
+                    call.model_dump(exclude_none=True)
+                    if callable(getattr(call, "model_dump", None)) else call
+                    for call in tool_calls
+                ]
+
+    if result.get("role", "assistant") != "assistant":
+        raise ValueError("Model response role must be 'assistant'.")
+    tool_calls = result.get("tool_calls")
+    if tool_calls is not None and not isinstance(tool_calls, (list, tuple)):
+        raise ValueError("Assistant tool_calls must be a list.")
+    for tool_call in tool_calls or []:
+        call_id, name, _arguments = _function_call_parts(tool_call)
+        if not call_id or not name:
+            raise ValueError("Each tool call must include a non-empty id and function name.")
+    return result
+
+
+def _function_call_parts(tool_call: Any) -> tuple[str, str, Any]:
+    if isinstance(tool_call, dict):
+        function = tool_call.get("function", {})
+        if not isinstance(function, dict):
+            function = {}
+        return (
+            str(tool_call.get("id", "")),
+            str(function.get("name", "")),
+            function.get("arguments", "{}"),
+        )
+    function = getattr(tool_call, "function", None)
     return (
-        len(command) == 2
-        and command[0] == "python"
-        and command[1].casefold().endswith(".py")
+        str(getattr(tool_call, "id", "")),
+        str(getattr(function, "name", "")),
+        getattr(function, "arguments", "{}"),
     )
 
 
-def serialize_tool_result(result: ToolResult) -> str:
-    return json.dumps(asdict(result), ensure_ascii=False)
-
-
-def _get_value(value: Any, name: str, default: Any = None) -> Any:
-    if isinstance(value, Mapping):
-        return value.get(name, default)
-    return getattr(value, name, default)
-
-
-def _normalize_tool_call(raw_call: Any) -> dict[str, Any]:
-    call_id = _get_value(raw_call, "id")
-    if not isinstance(call_id, str) or not call_id:
-        raise AgentProtocolError("Assistant tool call is missing a valid id.")
-
-    function = _get_value(raw_call, "function")
-    if function is None:
-        raise AgentProtocolError(f"Tool call '{call_id}' has no function payload.")
-    name = _get_value(function, "name", "")
-    arguments = _get_value(function, "arguments", "{}")
-    if not isinstance(name, str):
-        name = ""
-    if not isinstance(arguments, str):
-        arguments = ""
-    return {
-        "id": call_id,
-        "type": "function",
-        "function": {"name": name, "arguments": arguments},
-    }
-
-
-def _normalize_assistant_message(response: Any) -> dict[str, Any]:
-    if isinstance(response, str):
-        return {"role": "assistant", "content": response}
-    if isinstance(response, Mapping):
-        data = dict(response)
-    elif hasattr(response, "model_dump"):
-        data = response.model_dump(exclude_none=True)
-    else:
-        data = {
-            "content": _get_value(response, "content"),
-            "tool_calls": _get_value(response, "tool_calls"),
-        }
-
-    raw_calls = data.get("tool_calls")
-    if raw_calls is not None and not isinstance(raw_calls, (list, tuple)):
-        raise AgentProtocolError("Assistant tool_calls must be a list.")
-    tool_calls = [_normalize_tool_call(call) for call in (raw_calls or [])]
-    content = data.get("content")
-    if not tool_calls and (not isinstance(content, str) or not content.strip()):
-        raise AgentProtocolError(
-            "Assistant response contains neither tool calls nor final text."
-        )
-
-    message: dict[str, Any] = {"role": "assistant", "content": content}
-    if tool_calls:
-        message["tool_calls"] = tool_calls
-    return message
-
-
-def _parse_arguments(raw_arguments: Any) -> tuple[dict[str, Any] | None, ToolResult | None]:
+def _parse_arguments(raw_arguments: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if isinstance(raw_arguments, dict):
+        return raw_arguments, None
     if not isinstance(raw_arguments, str):
-        return None, ToolResult(False, error="Tool arguments must be a JSON string.")
+        return None, "Tool arguments must be a JSON object."
     try:
         arguments = json.loads(raw_arguments)
     except json.JSONDecodeError as exc:
-        return None, ToolResult(False, error=f"Invalid tool arguments JSON: {exc}")
+        return None, f"Invalid JSON arguments: {exc.msg}."
     if not isinstance(arguments, dict):
-        return None, ToolResult(False, error="Tool arguments must decode to an object.")
+        return None, "Tool arguments must decode to a JSON object."
     return arguments, None
 
 
-def _command_text(command: list[str]) -> str:
-    return " ".join(command)
+def _tool_result_payload(result: ToolResult) -> str:
+    return json.dumps(
+        {"success": result.success, "output": result.output, "error": result.error},
+        ensure_ascii=False,
+    )
+
+
+def _safe_tool_call_summary(name: str, arguments: dict[str, Any]) -> str:
+    safe_arguments = dict(arguments)
+    if name == "write_file" and "content" in safe_arguments:
+        content = safe_arguments["content"]
+        safe_arguments["content"] = (
+            f"<{len(content) if isinstance(content, str) else '?'} characters>"
+        )
+    rendered = json.dumps(safe_arguments, ensure_ascii=False)
+    if len(rendered) > MAX_TOOL_LOG_ARGUMENT_CHARS:
+        rendered = rendered[:MAX_TOOL_LOG_ARGUMENT_CHARS] + "..."
+    return rendered
 
 
 class CodingAgent:
+    """Run mandatory planning followed by a plan-constrained tool loop."""
+
     def __init__(
         self,
         llm_client: LLMChatClient,
         *,
-        tool_executor: Callable[[str, Mapping[str, Any]], ToolResult] = execute_tool,
+        tool_executor: Callable[[str, dict[str, Any]], ToolResult] = execute_tool,
         max_steps: int = MAX_STEPS,
         max_verification_requests: int = MAX_VERIFICATION_REQUESTS,
+        max_planning_attempts: int = MAX_PLANNING_ATTEMPTS,
+        max_replans: int = MAX_REPLANS,
+        max_plan_completion_reminders: int = MAX_PLAN_COMPLETION_REMINDERS,
         verbose: bool = True,
         output: Callable[[str], None] = print,
+        logger: Callable[[str], None] | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1.")
         if max_verification_requests < 0:
             raise ValueError("max_verification_requests cannot be negative.")
+        if max_planning_attempts < 1:
+            raise ValueError("max_planning_attempts must be at least 1.")
+        if max_replans < 0:
+            raise ValueError("max_replans cannot be negative.")
+        if max_plan_completion_reminders < 0:
+            raise ValueError("max_plan_completion_reminders cannot be negative.")
         self.llm_client = llm_client
         self.tool_executor = tool_executor
         self.max_steps = max_steps
         self.max_verification_requests = max_verification_requests
+        self.max_planning_attempts = max_planning_attempts
+        self.max_replans = max_replans
+        self.max_plan_completion_reminders = max_plan_completion_reminders
         self.verbose = verbose
         self.output = output
+        self.logger = logger or (output if verbose else lambda _message: None)
 
-    def _emit(self, message: str) -> None:
-        if self.verbose:
-            self.output(message)
-
-    def _log_arguments(self, arguments: dict[str, Any] | None) -> str:
-        if arguments is None:
-            return "<invalid JSON>"
-        visible = dict(arguments)
-        content = visible.get("content")
-        if isinstance(content, str):
-            visible["content"] = f"<{len(content)} characters>"
-        rendered = json.dumps(visible, ensure_ascii=False)
-        return rendered if len(rendered) <= 500 else rendered[:480] + "...[truncated]"
-
-    def _fatal(
+    def _result(
         self,
-        message: str,
-        step: int,
-        messages: list[dict[str, Any]],
+        status: AgentStatus,
+        final_answer: str,
         evidence: list[VerificationEvidence],
+        plans: list[TaskPlan],
+        steps: int,
+        messages: list[dict[str, Any]],
+        error: str | None = None,
     ) -> AgentResult:
-        return AgentResult(
-            status=AgentStatus.FATAL_ERROR,
-            final_answer="Agent stopped because of a fatal error.",
-            verification_evidence=evidence,
-            steps=step,
-            messages=messages,
-            error=message,
+        return AgentResult(status, final_answer, evidence, plans, steps, messages, error)
+
+    def _fatal(self, reason: str, evidence: list[VerificationEvidence], plans: list[TaskPlan],
+               steps: int, messages: list[dict[str, Any]]) -> AgentResult:
+        self.logger("[Status] FATAL_ERROR")
+        return self._result(
+            AgentStatus.FATAL_ERROR,
+            "Agent stopped because the model response or API call failed.",
+            evidence, plans, steps, messages, reason,
+        )
+
+    def _plan_failed(self, reason: str, evidence: list[VerificationEvidence],
+                     plans: list[TaskPlan], steps: int,
+                     messages: list[dict[str, Any]]) -> AgentResult:
+        self.logger("[Status] PLAN_FAILED")
+        return self._result(
+            AgentStatus.PLAN_FAILED,
+            "Agent stopped because it could not obtain or follow a valid task plan.",
+            evidence, plans, steps, messages, reason,
+        )
+
+    def _log_plan(self, plan: TaskPlan, *, replan: bool = False) -> None:
+        label = "Replan" if replan else "Plan"
+        self.logger(f"[{label} revision {plan.revision}]")
+        if not plan.steps:
+            self.logger("(no local tool steps)")
+        for index, step in enumerate(plan.steps, start=1):
+            constraints = json.dumps(step.argument_constraints, ensure_ascii=False)
+            self.logger(f"{index}. {step.tool} {constraints}")
+
+    def _request_plan(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        revision: int,
+        verification_required: bool,
+    ) -> tuple[TaskPlan | None, str | None, str | None]:
+        last_error = "The model did not return a valid plan."
+        for attempt in range(1, self.max_planning_attempts + 1):
+            try:
+                raw_plan = self.llm_client.chat(messages=messages)
+            except Exception as exc:
+                return None, None, f"Planning API request failed: {exc}"
+            messages.append({"role": "assistant", "content": raw_plan})
+            try:
+                plan = parse_plan(
+                    raw_plan,
+                    revision=revision,
+                    verification_required=verification_required,
+                )
+            except PlanValidationError as exc:
+                last_error = str(exc)
+                self.logger(f"[Planning attempt {attempt}] invalid plan: {last_error}")
+                if attempt < self.max_planning_attempts:
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            f"The proposed plan is invalid: {last_error} "
+                            "Return a corrected strict JSON plan only."
+                        ),
+                    })
+                continue
+            return plan, None, None
+        return None, last_error, None
+
+    def _replan(
+        self,
+        *,
+        task: str,
+        current_plan: TaskPlan,
+        reason: str,
+        revision: int,
+        verification_required: bool,
+        messages: list[dict[str, Any]],
+    ) -> tuple[TaskPlan | None, str | None, str | None]:
+        messages.append({
+            "role": "system",
+            "content": (
+                f"{PLANNING_PROMPT}\n\nREPLANNING CONTEXT\n"
+                f"Original task: {task}\n"
+                f"Previous plan and completed statuses:\n{plan_as_json(current_plan)}\n"
+                f"Deviation reason: {reason}\n"
+                "Return a complete plan for the remaining work only. Do not repeat completed "
+                "steps. Preserve the original goal and use only necessary local actions."
+            ),
+        })
+        return self._request_plan(
+            messages, revision=revision, verification_required=verification_required
         )
 
     def run(self, task: str) -> AgentResult:
-        if not isinstance(task, str) or not task.strip():
-            return self._fatal("Task must be a non-empty string.", 0, [], [])
-
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": task},
-        ]
+        messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         evidence: list[VerificationEvidence] = []
+        plan_history: list[TaskPlan] = []
+        if not isinstance(task, str) or not task.strip():
+            return self._fatal(
+                "Task must be a non-empty string.", evidence, plan_history, 0, messages
+            )
         verification_required = task_requires_verification(task)
-        verification_requests = 0
         workspace_revision = 0
+        last_verified_revision: int | None = None
+        verification_requests = 0
+        plan_completion_reminders = 0
+        replans = 0
 
-        for step in range(1, self.max_steps + 1):
-            self._emit(f"[Step {step}]")
+        self.logger("[Planning inventory]")
+        try:
+            inventory = self.tool_executor("list_files", {"path": "."})
+        except Exception as exc:
+            inventory = ToolResult(False, error=f"Workspace inventory failed: {exc}")
+        if not isinstance(inventory, ToolResult):
+            inventory = ToolResult(False, error="Workspace inventory returned an invalid result.")
+        self.logger(f"[Tool result] success={inventory.success}")
+        if not inventory.success:
+            return self._plan_failed(
+                inventory.error or "Unable to inspect the controlled workspace root.",
+                evidence, plan_history, 0, messages,
+            )
+
+        messages.extend([
+            {
+                "role": "system",
+                "content": (
+                    f"{PLANNING_PROMPT}\n\n"
+                    f"Task requires verification: {verification_required}.\n"
+                    "Controlled workspace root inventory (names and types only):\n"
+                    f"{inventory.output}"
+                ),
+            },
+            {"role": "user", "content": task},
+        ])
+        current_plan, planning_error, fatal_error = self._request_plan(
+            messages, revision=0, verification_required=verification_required
+        )
+        if fatal_error:
+            return self._fatal(fatal_error, evidence, plan_history, 0, messages)
+        if current_plan is None:
+            return self._plan_failed(
+                planning_error or "Unable to obtain a valid initial plan.",
+                evidence, plan_history, 0, messages,
+            )
+        plan_history.append(current_plan)
+        self._log_plan(current_plan)
+        messages.append({
+            "role": "system",
+            "content": (
+                "The following plan is accepted and mandatory. Execute pending steps in order:\n"
+                f"{plan_as_json(current_plan)}"
+            ),
+        })
+        current_step_index = 0
+
+        for step_number in range(1, self.max_steps + 1):
+            self.logger(f"[Step {step_number}]")
             try:
-                response = self.llm_client.chat(messages=messages, tools=TOOLS)
-                assistant_message = _normalize_assistant_message(response)
+                raw_message = self.llm_client.chat(messages=messages, tools=TOOLS)
+                assistant_message = _assistant_message_to_dict(raw_message)
             except Exception as exc:
                 return self._fatal(
-                    f"LLM communication or message error: {exc}",
-                    step,
-                    messages,
-                    evidence,
+                    f"LLM request failed: {exc}", evidence, plan_history,
+                    step_number, messages,
+                )
+            messages.append(assistant_message)
+            tool_calls = assistant_message.get("tool_calls") or []
+
+            if not tool_calls:
+                final_answer = assistant_message.get("content")
+                if not isinstance(final_answer, str) or not final_answer.strip():
+                    return self._fatal(
+                        "Model returned neither tool calls nor usable final text.",
+                        evidence, plan_history, step_number, messages,
+                    )
+                if current_step_index < len(current_plan.steps):
+                    plan_completion_reminders += 1
+                    if plan_completion_reminders > self.max_plan_completion_reminders:
+                        return self._plan_failed(
+                            "The model repeatedly returned a final answer before completing the plan.",
+                            evidence, plan_history, step_number, messages,
+                        )
+                    pending = current_plan.steps[current_step_index]
+                    self.logger(
+                        f"[Plan incomplete] pending={pending.id} reminder="
+                        f"{plan_completion_reminders}/{self.max_plan_completion_reminders}"
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "Do not answer yet. Continue the accepted plan. The next pending step "
+                            f"is {pending.id}: {pending.description}, using {pending.tool}."
+                        ),
+                    })
+                    continue
+
+                verified_current_revision = last_verified_revision == workspace_revision
+                if verification_required and not verified_current_revision:
+                    verification_requests += 1
+                    if verification_requests > self.max_verification_requests:
+                        self.logger("[Status] VERIFICATION_REQUIRED")
+                        return self._result(
+                            AgentStatus.VERIFICATION_REQUIRED, final_answer, evidence,
+                            plan_history, step_number, messages,
+                            "The current workspace revision has no successful verification evidence.",
+                        )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "The plan is complete, but the current workspace revision still requires "
+                            "successful verification. Use an allowed verification command."
+                        ),
+                    })
+                    continue
+
+                self.logger("[Status] COMPLETED")
+                return self._result(
+                    AgentStatus.COMPLETED, final_answer.strip(), evidence,
+                    plan_history, step_number, messages,
                 )
 
-            messages.append(assistant_message)
-            tool_calls = assistant_message.get("tool_calls", [])
-            if tool_calls:
-                for tool_call in tool_calls:
-                    name = tool_call["function"]["name"]
-                    raw_arguments = tool_call["function"]["arguments"]
-                    arguments, parse_error = _parse_arguments(raw_arguments)
-                    self._emit(f"Tool call: {name or '<missing name>'}")
-                    self._emit(f"Arguments: {self._log_arguments(arguments)}")
+            parsed_calls: list[tuple[str, str, dict[str, Any] | None, str | None]] = []
+            for tool_call in tool_calls:
+                call_id, name, raw_arguments = _function_call_parts(tool_call)
+                arguments, argument_error = _parse_arguments(raw_arguments)
+                parsed_calls.append((call_id, name, arguments, argument_error))
 
-                    if parse_error is not None:
-                        result = parse_error
-                    else:
-                        try:
-                            result = self.tool_executor(name, arguments or {})
-                            if not isinstance(result, ToolResult):
-                                result = ToolResult(
-                                    False, error="Tool returned an invalid result type."
-                                )
-                        except Exception as exc:
-                            result = ToolResult(
-                                False, error=f"Unexpected tool execution error: {exc}"
-                            )
-
-                    if name == "write_file" and result.success:
-                        workspace_revision += 1
-                        verification_required = True
-
-                    command = (
-                        arguments.get("command")
-                        if name == "execute_command" and arguments is not None
-                        else None
+            if any(item[3] is not None for item in parsed_calls):
+                for call_id, name, _arguments, argument_error in parsed_calls:
+                    error = argument_error or (
+                        "Tool batch was not executed because another call had invalid arguments."
                     )
-                    if is_verification_command(command):
-                        verification = VerificationEvidence(
-                            command=_command_text(command),
-                            success=result.success,
-                            output=result.output,
-                            error=result.error,
-                            step=step,
-                            workspace_revision=workspace_revision,
-                        )
-                        evidence.append(verification)
-                        state = "passed" if result.success else "failed"
-                        self._emit(
-                            f"[Verification evidence] {verification.command}: {state}"
-                        )
-
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "content": serialize_tool_result(result),
-                        }
-                    )
-                    self._emit(f"[Tool result] success={result.success}")
+                    messages.append({
+                        "role": "tool", "tool_call_id": call_id, "name": name,
+                        "content": _tool_result_payload(ToolResult(False, error=error)),
+                    })
                 continue
 
-            final_text = assistant_message["content"].strip()
-            if not verification_required:
-                return AgentResult(
-                    AgentStatus.COMPLETED,
-                    final_text,
-                    evidence,
-                    step,
-                    messages,
-                )
-
-            current_verification = bool(
-                evidence
-                and evidence[-1].success
-                and evidence[-1].workspace_revision == workspace_revision
-            )
-            if current_verification:
-                return AgentResult(
-                    AgentStatus.COMPLETED,
-                    final_text,
-                    evidence,
-                    step,
-                    messages,
-                )
-
-            if verification_requests >= self.max_verification_requests:
-                return AgentResult(
-                    AgentStatus.VERIFICATION_REQUIRED,
-                    (
-                        "Task was not marked completed because no successful "
-                        "verification evidence was obtained for the latest changes."
-                    ),
-                    evidence,
-                    step,
-                    messages,
-                    error="Successful current verification is required.",
-                )
-
-            verification_requests += 1
-            if evidence and not evidence[-1].success:
-                reason = (
-                    "The latest verification command failed. Fix the problem and run "
-                    "an allowed verification command again before giving a final answer."
-                )
-            elif evidence:
-                reason = (
-                    "The workspace changed after the last successful verification. "
-                    "Run an allowed verification command for the current code before "
-                    "giving a final answer."
-                )
+            remaining = current_plan.steps[current_step_index:]
+            deviations: list[str] = []
+            if len(parsed_calls) > len(remaining):
+                deviations.append("The batch contains more calls than remaining plan steps.")
             else:
-                reason = (
-                    "This task requires verification, but no successful verification "
-                    "evidence exists. Run an applicable allowed test or Python command "
-                    "with execute_command before giving a final answer."
-                )
-            messages.append({"role": "system", "content": reason})
-            self._emit(f"[Verification required] request {verification_requests}")
+                for offset, (_call_id, name, arguments, _error) in enumerate(parsed_calls):
+                    matched, match_error = match_plan_step(
+                        remaining[offset], name, arguments or {}
+                    )
+                    if not matched and match_error:
+                        deviations.append(match_error)
 
-        missing = verification_required and not (
-            evidence
-            and evidence[-1].success
-            and evidence[-1].workspace_revision == workspace_revision
-        )
-        final_answer = "Maximum agent steps reached before the task completed."
-        if missing:
-            final_answer += " No successful current verification evidence was obtained."
-        return AgentResult(
+            if deviations:
+                reason = " ".join(deviations)
+                self.logger(f"[Plan deviation] {reason}")
+                for call_id, name, _arguments, _error in parsed_calls:
+                    messages.append({
+                        "role": "tool", "tool_call_id": call_id, "name": name,
+                        "content": _tool_result_payload(
+                            ToolResult(False, error=f"Plan deviation: {reason}")
+                        ),
+                    })
+                if replans >= self.max_replans:
+                    return self._plan_failed(
+                        "The maximum number of replans was exceeded.", evidence,
+                        plan_history, step_number, messages,
+                    )
+                replans += 1
+                new_plan, planning_error, fatal_error = self._replan(
+                    task=task, current_plan=current_plan, reason=reason,
+                    revision=replans, verification_required=verification_required,
+                    messages=messages,
+                )
+                if fatal_error:
+                    return self._fatal(
+                        fatal_error, evidence, plan_history, step_number, messages
+                    )
+                if new_plan is None:
+                    return self._plan_failed(
+                        planning_error or "Unable to obtain a valid revised plan.",
+                        evidence, plan_history, step_number, messages,
+                    )
+                current_plan = new_plan
+                plan_history.append(current_plan)
+                current_step_index = 0
+                plan_completion_reminders = 0
+                self._log_plan(current_plan, replan=True)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "The revised plan is accepted and mandatory. Execute pending steps in order:\n"
+                        f"{plan_as_json(current_plan)}"
+                    ),
+                })
+                continue
+
+            batch_blocked = False
+            for offset, (call_id, name, arguments, _error) in enumerate(parsed_calls):
+                planned_step = remaining[offset]
+                if batch_blocked:
+                    result = ToolResult(
+                        False, error="Not executed because an earlier call in this batch failed."
+                    )
+                else:
+                    safe_arguments = arguments or {}
+                    self.logger(f"Tool call: {name}")
+                    self.logger(f"Arguments: {_safe_tool_call_summary(name, safe_arguments)}")
+                    try:
+                        result = self.tool_executor(name, safe_arguments)
+                    except Exception as exc:
+                        result = ToolResult(False, error=f"Tool execution failed: {exc}")
+                    if not isinstance(result, ToolResult):
+                        result = ToolResult(False, error="Tool returned an invalid result.")
+                messages.append({
+                    "role": "tool", "tool_call_id": call_id, "name": name,
+                    "content": _tool_result_payload(result),
+                })
+                self.logger(f"[Tool result] success={result.success}")
+
+                command = (arguments or {}).get("command")
+                if name == "execute_command" and is_verification_command(command):
+                    item = VerificationEvidence(
+                        step=step_number,
+                        command=" ".join(command),
+                        success=result.success,
+                        output=result.output,
+                        error=result.error,
+                        workspace_revision=workspace_revision,
+                    )
+                    evidence.append(item)
+                    if result.success:
+                        last_verified_revision = workspace_revision
+                    self.logger(
+                        f"[Verification evidence] {' '.join(command)}: "
+                        f"{'passed' if result.success else 'failed'}"
+                    )
+                if not result.success:
+                    batch_blocked = True
+                    continue
+
+                planned_step.status = PlanStepStatus.COMPLETED
+                current_step_index += 1
+                plan_completion_reminders = 0
+                command = (arguments or {}).get("command")
+                if name == "write_file":
+                    verification_required = True
+                    workspace_revision += 1
+
+        self.logger("[Status] MAX_STEPS_REACHED")
+        return self._result(
             AgentStatus.MAX_STEPS_REACHED,
-            final_answer,
-            evidence,
-            self.max_steps,
-            messages,
-            error="Maximum agent steps reached.",
+            "Agent stopped after reaching the maximum number of steps.",
+            evidence, plan_history, self.max_steps, messages,
+            "The agent did not finish within the configured step limit.",
         )

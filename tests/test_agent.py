@@ -1,4 +1,4 @@
-"""Unit tests for the v0.3 agent and verified termination loop."""
+"""Unit tests for the v0.4 plan-constrained agent loop."""
 
 import json
 from collections.abc import Mapping, Sequence
@@ -7,13 +7,41 @@ from typing import Any
 
 import pytest
 
-from agent import (
-    AgentStatus,
-    CodingAgent,
+from agent import AgentStatus, CodingAgent, task_requires_verification
+from planning import (
+    MAX_PLAN_STEPS,
+    PlanStep,
+    PlanStepStatus,
+    TaskPlan,
     is_verification_command,
-    task_requires_verification,
 )
-from tools import ToolResult, execute_tool
+from tools import ToolResult
+
+
+def planned_step(
+    step_id: str,
+    tool: str,
+    constraints: dict[str, Any],
+    description: str = "Perform an atomic action",
+) -> dict[str, Any]:
+    return {
+        "id": step_id,
+        "description": description,
+        "tool": tool,
+        "argument_constraints": constraints,
+        "rationale": "This action directly supports the user goal",
+    }
+
+
+def plan_response(
+    steps: list[dict[str, Any]],
+    goal: str = "Complete the requested task",
+) -> str:
+    return json.dumps({
+        "goal": goal,
+        "success_criteria": ["The requested outcome is complete"],
+        "steps": steps,
+    })
 
 
 def tool_call(call_id: str, name: str, arguments: Any) -> dict[str, Any]:
@@ -29,7 +57,7 @@ def tool_response(*calls: dict[str, Any]) -> dict[str, Any]:
     return {"role": "assistant", "content": None, "tool_calls": list(calls)}
 
 
-def final_response(content: str) -> dict[str, Any]:
+def final_response(content: str = "Done.") -> dict[str, Any]:
     return {"role": "assistant", "content": content}
 
 
@@ -41,23 +69,34 @@ class FakeLLM:
     def chat(
         self,
         messages: Sequence[Mapping[str, Any]],
-        tools: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> Any:
-        self.calls.append(
-            {"messages": deepcopy(list(messages)), "tools": deepcopy(list(tools))}
-        )
+        self.calls.append({
+            "messages": deepcopy(list(messages)),
+            "tools": deepcopy(list(tools)) if tools is not None else None,
+        })
         if not self.responses:
             raise AssertionError("FakeLLM has no response left")
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class FakeExecutor:
-    def __init__(self, results: list[ToolResult]) -> None:
-        self.results = list(results)
+    def __init__(
+        self,
+        results: list[ToolResult] | None = None,
+        inventory: ToolResult | None = None,
+    ) -> None:
+        self.results = list(results or [])
+        self.inventory = inventory or ToolResult(True, "[FILE] calculator.py")
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def __call__(self, name: str, arguments: Mapping[str, Any]) -> ToolResult:
         self.calls.append((name, dict(arguments)))
+        if len(self.calls) == 1 and name == "list_files" and arguments == {"path": "."}:
+            return self.inventory
         if not self.results:
             raise AssertionError("FakeExecutor has no result left")
         return self.results.pop(0)
@@ -65,384 +104,374 @@ class FakeExecutor:
 
 def run_agent(
     llm: FakeLLM,
-    executor=execute_tool,
+    executor: FakeExecutor | None = None,
     **kwargs: Any,
 ):
     return CodingAgent(
         llm,
-        tool_executor=executor,
-        verbose=False,
+        tool_executor=executor or FakeExecutor(),
+        logger=lambda _message: None,
         **kwargs,
     ).run
 
 
-def test_information_task_direct_answer_completes() -> None:
-    llm = FakeLLM([final_response("It is a calculator project.")])
+def test_planning_precedes_tools_and_receives_root_inventory() -> None:
+    llm = FakeLLM([plan_response([]), final_response("A calculator project.")])
+    executor = FakeExecutor()
 
-    result = run_agent(llm)("Inspect the workspace and explain what it does.")
-
-    assert result.status is AgentStatus.COMPLETED
-    assert result.final_answer == "It is a calculator project."
-    assert result.verification_evidence == []
-
-
-def test_single_tool_call_returns_observation_to_llm() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(tool_call("call-read", "read_file", {"path": "a.py"})),
-            final_response("The file prints hello."),
-        ]
-    )
-    executor = FakeExecutor([ToolResult(True, "print('hello')")])
-
-    result = run_agent(llm, executor)("Read and explain a.py.")
+    result = run_agent(llm, executor)("Explain this project.")
 
     assert result.status is AgentStatus.COMPLETED
-    assert executor.calls == [("read_file", {"path": "a.py"})]
-    tool_message = llm.calls[1]["messages"][-1]
-    assert tool_message["role"] == "tool"
-    assert tool_message["tool_call_id"] == "call-read"
-    assert json.loads(tool_message["content"]) == {
-        "success": True,
-        "output": "print('hello')",
-        "error": None,
-    }
-
-
-def test_code_change_requires_successful_verification() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(
-                tool_call(
-                    "call-write",
-                    "write_file",
-                    {"path": "a.py", "content": "print('ok')"},
-                )
-            ),
-            tool_response(
-                tool_call("call-test", "execute_command", {"command": ["pytest"]})
-            ),
-            final_response("Implemented and tested."),
-        ]
+    assert executor.calls == [("list_files", {"path": "."})]
+    assert llm.calls[0]["tools"] is None
+    planning_text = "\n".join(
+        str(message.get("content", "")) for message in llm.calls[0]["messages"]
     )
-    executor = FakeExecutor(
-        [
-            ToolResult(True, "Wrote file."),
-            ToolResult(True, "exit_code: 0\n1 passed"),
-        ]
-    )
-
-    result = run_agent(llm, executor)("Implement the requested code change.")
-
-    assert result.status is AgentStatus.COMPLETED
-    assert len(result.verification_evidence) == 1
-    evidence = result.verification_evidence[0]
-    assert evidence.command == "pytest"
-    assert evidence.success
-    assert evidence.output == "exit_code: 0\n1 passed"
-    assert evidence.error is None
-    assert evidence.step == 2
-    assert evidence.workspace_revision == 1
+    assert "[FILE] calculator.py" in planning_text
+    assert llm.calls[1]["tools"] is not None
 
 
-def test_unverified_change_prompts_model_then_accepts_real_verification() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(
-                tool_call(
-                    "write",
-                    "write_file",
-                    {"path": "a.py", "content": "value = 1"},
-                )
-            ),
-            final_response("Done without running tests."),
-            tool_response(
-                tool_call(
-                    "verify", "execute_command", {"command": ["python", "a.py"]}
-                )
-            ),
-            final_response("Implemented and verified."),
-        ]
-    )
-    executor = FakeExecutor(
-        [ToolResult(True, "Wrote file."), ToolResult(True, "exit_code: 0")]
-    )
+def test_inventory_failure_returns_plan_failed_without_llm_call() -> None:
+    llm = FakeLLM([])
+    executor = FakeExecutor(inventory=ToolResult(False, error="cannot list root"))
+
+    result = run_agent(llm, executor)("Explain the project.")
+
+    assert result.status is AgentStatus.PLAN_FAILED
+    assert llm.calls == []
+
+
+def test_legal_write_and_verification_plan_completes_in_order() -> None:
+    steps = [
+        planned_step("write", "write_file", {"path": "a.py"}),
+        planned_step("verify", "execute_command", {"command": ["python", "-m", "pytest"]}),
+    ]
+    llm = FakeLLM([
+        plan_response(steps),
+        tool_response(tool_call("w", "write_file", {"path": "a.py", "content": "x = 1"})),
+        tool_response(tool_call("t", "execute_command", {"command": ["python", "-m", "pytest"]})),
+        final_response("Implemented and verified."),
+    ])
+    executor = FakeExecutor([ToolResult(True, "wrote"), ToolResult(True, "1 passed")])
 
     result = run_agent(llm, executor)("Create a.py.")
 
     assert result.status is AgentStatus.COMPLETED
-    reminder_messages = [
-        message
-        for message in llm.calls[2]["messages"]
-        if message["role"] == "system" and "requires verification" in message["content"]
+    assert [name for name, _ in executor.calls] == ["list_files", "write_file", "execute_command"]
+    assert all(step.status is PlanStepStatus.COMPLETED for step in result.plan_history[0].steps)
+    assert result.verification_evidence[-1].workspace_revision == 1
+
+
+def test_dijkstra_greenfield_plan_does_not_read_calculator_files() -> None:
+    steps = [
+        planned_step("implementation", "write_file", {"path": "dijkstra.py"}),
+        planned_step("tests", "write_file", {"path": "test_dijkstra.py"}),
+        planned_step("verify", "execute_command", {"command": ["python", "-m", "pytest"]}),
     ]
-    assert reminder_messages
+    llm = FakeLLM([
+        plan_response(steps, "Implement and verify Dijkstra"),
+        tool_response(
+            tool_call("w1", "write_file", {"path": "dijkstra.py", "content": "code"}),
+            tool_call("w2", "write_file", {"path": "test_dijkstra.py", "content": "tests"}),
+            tool_call("v", "execute_command", {"command": ["python", "-m", "pytest"]}),
+        ),
+        final_response("Dijkstra is implemented and tested."),
+    ])
+    executor = FakeExecutor([
+        ToolResult(True, "wrote"), ToolResult(True, "wrote"), ToolResult(True, "passed")
+    ])
 
-
-def test_failed_verification_can_be_fixed_and_reverified() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(
-                tool_call("w1", "write_file", {"path": "a.py", "content": "bad"})
-            ),
-            tool_response(
-                tool_call("t1", "execute_command", {"command": ["pytest"]})
-            ),
-            tool_response(
-                tool_call("w2", "write_file", {"path": "a.py", "content": "good"})
-            ),
-            tool_response(
-                tool_call("t2", "execute_command", {"command": ["pytest"]})
-            ),
-            final_response("Fixed and verified."),
-        ]
-    )
-    executor = FakeExecutor(
-        [
-            ToolResult(True, "wrote bad"),
-            ToolResult(False, "exit_code: 1", "tests failed"),
-            ToolResult(True, "wrote good"),
-            ToolResult(True, "exit_code: 0\n1 passed"),
-        ]
-    )
-
-    result = run_agent(llm, executor)("Fix the failing code.")
+    result = run_agent(llm, executor)("请实现标准 Dijkstra 算法")
 
     assert result.status is AgentStatus.COMPLETED
-    assert [item.success for item in result.verification_evidence] == [False, True]
-    assert result.verification_evidence[-1].workspace_revision == 2
+    assert all(name != "read_file" for name, _ in executor.calls)
+    assert "calculator.py" not in plan_response(steps)
 
 
-def test_failed_verification_then_final_is_not_completed() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(
-                tool_call("w", "write_file", {"path": "a.py", "content": "bad"})
-            ),
-            tool_response(
-                tool_call("t", "execute_command", {"command": ["pytest"]})
-            ),
-            final_response("Everything is complete."),
-            final_response("Still complete."),
-        ]
-    )
-    executor = FakeExecutor(
-        [
-            ToolResult(True, "wrote"),
-            ToolResult(False, "exit_code: 1", "failed"),
-        ]
-    )
+def test_unplanned_call_is_rejected_with_call_id_then_replanned() -> None:
+    initial = [planned_step("read_a", "read_file", {"path": "a.py"})]
+    revised = [planned_step("read_b", "read_file", {"path": "b.py"})]
+    llm = FakeLLM([
+        plan_response(initial),
+        tool_response(tool_call("deviated-call", "read_file", {"path": "b.py"})),
+        plan_response(revised),
+        tool_response(tool_call("planned-call", "read_file", {"path": "b.py"})),
+        final_response("Explained b.py."),
+    ])
+    executor = FakeExecutor([ToolResult(True, "contents")])
 
-    result = run_agent(llm, executor, max_verification_requests=1)("Fix a.py.")
-
-    assert result.status is AgentStatus.VERIFICATION_REQUIRED
-    assert result.status is not AgentStatus.COMPLETED
-    assert result.verification_evidence[-1].success is False
-
-
-def test_multiple_tool_calls_all_execute_and_keep_ids() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(
-                tool_call("one", "list_files", {"path": "."}),
-                tool_call("two", "read_file", {"path": "a.py"}),
-            ),
-            final_response("Inspected both results."),
-        ]
-    )
-    executor = FakeExecutor(
-        [ToolResult(True, "a.py"), ToolResult(True, "content")]
-    )
-
-    result = run_agent(llm, executor)("Inspect and explain the workspace.")
+    result = run_agent(llm, executor)("Explain the requested file.")
 
     assert result.status is AgentStatus.COMPLETED
-    assert [call[0] for call in executor.calls] == ["list_files", "read_file"]
-    tool_messages = [
-        message for message in llm.calls[1]["messages"] if message["role"] == "tool"
+    assert executor.calls[1:] == [("read_file", {"path": "b.py"})]
+    deviation_messages = [
+        message for message in llm.calls[2]["messages"]
+        if message.get("role") == "tool"
     ]
-    assert [message["tool_call_id"] for message in tool_messages] == ["one", "two"]
+    assert deviation_messages[-1]["tool_call_id"] == "deviated-call"
+    assert "Plan deviation" in deviation_messages[-1]["content"]
+    assert [plan.revision for plan in result.plan_history] == [0, 1]
 
 
-def test_invalid_json_is_observed_without_execution() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(tool_call("bad-json", "read_file", "{not json")),
-            final_response("The tool arguments were invalid."),
-        ]
-    )
-    executor = FakeExecutor([])
+def test_more_than_two_replans_returns_plan_failed() -> None:
+    def read_plan(path: str) -> str:
+        return plan_response([planned_step(f"read_{path}", "read_file", {"path": path})])
 
-    result = run_agent(llm, executor)("Inspect and explain a file.")
+    llm = FakeLLM([
+        read_plan("a.py"),
+        tool_response(tool_call("d1", "read_file", {"path": "b.py"})),
+        read_plan("b.py"),
+        tool_response(tool_call("d2", "read_file", {"path": "c.py"})),
+        read_plan("c.py"),
+        tool_response(tool_call("d3", "read_file", {"path": "d.py"})),
+    ])
+    executor = FakeExecutor()
 
-    assert result.status is AgentStatus.COMPLETED
-    assert executor.calls == []
-    observation = json.loads(llm.calls[1]["messages"][-1]["content"])
-    assert observation["success"] is False
-    assert "Invalid tool arguments JSON" in observation["error"]
+    result = run_agent(llm, executor)("Explain a file.")
+
+    assert result.status is AgentStatus.PLAN_FAILED
+    assert len(result.plan_history) == 3
+    assert executor.calls == [("list_files", {"path": "."})]
 
 
 @pytest.mark.parametrize(
-    "arguments",
+    "invalid_plan",
     [
-        [],
-        {},
-        {"path": "a.py", "unexpected": True},
+        "not-json",
+        plan_response([planned_step("bad", "missing_tool", {})]),
+        plan_response([
+            planned_step("duplicate", "read_file", {"path": "a.py"}),
+            planned_step("duplicate", "read_file", {"path": "b.py"}),
+        ]),
+        plan_response([planned_step("bad", "read_file", {"path": "a.py", "extra": 1})]),
+        plan_response([
+            planned_step(str(index), "read_file", {"path": f"{index}.py"})
+            for index in range(MAX_PLAN_STEPS + 1)
+        ]),
     ],
 )
-def test_non_object_missing_and_extra_arguments_are_observed(arguments: Any) -> None:
-    llm = FakeLLM(
-        [
-            tool_response(tool_call("bad-arguments", "read_file", arguments)),
-            final_response("The arguments were rejected."),
-        ]
-    )
+def test_invalid_plan_is_corrected_on_second_attempt(invalid_plan: str) -> None:
+    llm = FakeLLM([invalid_plan, plan_response([]), final_response()])
 
-    result = run_agent(llm)("Inspect and explain a file.")
+    result = run_agent(llm)("Explain the project.")
 
     assert result.status is AgentStatus.COMPLETED
-    observation = json.loads(llm.calls[1]["messages"][-1]["content"])
-    assert observation["success"] is False
-    assert observation["error"]
-
-
-def test_unknown_tool_is_an_observation() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(tool_call("unknown", "delete_everything", {})),
-            final_response("That tool is unavailable."),
-        ]
+    assert llm.calls[0]["tools"] is None
+    assert llm.calls[1]["tools"] is None
+    assert any(
+        "invalid" in str(message.get("content", "")).lower()
+        for message in llm.calls[1]["messages"]
     )
 
-    result = run_agent(llm)("Inspect and explain the workspace.")
+
+def test_two_invalid_plans_return_plan_failed() -> None:
+    llm = FakeLLM(["bad", "still bad"])
+    result = run_agent(llm)("Explain the project.")
+    assert result.status is AgentStatus.PLAN_FAILED
+    assert result.plan_history == []
+
+
+def test_matching_consecutive_batch_executes_all_calls() -> None:
+    steps = [
+        planned_step("list", "list_files", {"path": "."}),
+        planned_step("read", "read_file", {"path": "a.py"}),
+    ]
+    llm = FakeLLM([
+        plan_response(steps),
+        tool_response(
+            tool_call("one", "list_files", {"path": "."}),
+            tool_call("two", "read_file", {"path": "a.py"}),
+        ),
+        final_response(),
+    ])
+    executor = FakeExecutor([ToolResult(True, "a.py"), ToolResult(True, "content")])
+
+    result = run_agent(llm, executor)("Inspect the workspace.")
 
     assert result.status is AgentStatus.COMPLETED
-    observation = json.loads(llm.calls[1]["messages"][-1]["content"])
-    assert observation["success"] is False
-    assert "Unknown tool" in observation["error"]
+    assert [name for name, _ in executor.calls[1:]] == ["list_files", "read_file"]
 
 
-def test_ordinary_tool_failure_returns_to_model() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(tool_call("missing", "read_file", {"path": "missing.py"})),
-            final_response("The requested file does not exist."),
-        ]
-    )
-    executor = FakeExecutor([ToolResult(False, error="File does not exist")])
+def test_one_batch_deviation_rejects_entire_batch() -> None:
+    initial = [
+        planned_step("list", "list_files", {"path": "."}),
+        planned_step("read", "read_file", {"path": "a.py"}),
+    ]
+    llm = FakeLLM([
+        plan_response(initial),
+        tool_response(
+            tool_call("one", "list_files", {"path": "."}),
+            tool_call("two", "read_file", {"path": "wrong.py"}),
+        ),
+        plan_response([]),
+        final_response(),
+    ])
+    executor = FakeExecutor()
 
-    result = run_agent(llm, executor)("Read and explain missing.py.")
+    result = run_agent(llm, executor)("Inspect the workspace.")
 
     assert result.status is AgentStatus.COMPLETED
-    assert json.loads(llm.calls[1]["messages"][-1]["content"])["success"] is False
+    assert executor.calls == [("list_files", {"path": "."})]
+    observations = [
+        message for message in llm.calls[2]["messages"]
+        if message.get("role") == "tool"
+    ]
+    assert {item["tool_call_id"] for item in observations[-2:]} == {"one", "two"}
 
 
-def test_successful_information_command_is_not_verification() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(
-                tool_call("status", "execute_command", {"command": ["git", "status"]})
-            ),
-            final_response("The code is fixed."),
-        ]
-    )
-    executor = FakeExecutor([ToolResult(True, "exit_code: 0")])
+def test_failed_tool_keeps_step_pending_until_successful_retry() -> None:
+    plan = plan_response([planned_step("read", "read_file", {"path": "a.py"})])
+    llm = FakeLLM([
+        plan,
+        tool_response(tool_call("first", "read_file", {"path": "a.py"})),
+        tool_response(tool_call("retry", "read_file", {"path": "a.py"})),
+        final_response(),
+    ])
+    executor = FakeExecutor([
+        ToolResult(False, error="missing"), ToolResult(True, "content")
+    ])
 
-    result = run_agent(llm, executor, max_verification_requests=0)("Fix the code.")
+    result = run_agent(llm, executor)("Explain a.py.")
 
-    assert result.status is AgentStatus.VERIFICATION_REQUIRED
-    assert result.verification_evidence == []
-
-
-def test_failed_execute_command_is_recorded_and_returned() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(
-                tool_call("test", "execute_command", {"command": ["pytest"]})
-            ),
-            final_response("Tests passed."),
-        ]
-    )
-    executor = FakeExecutor([ToolResult(False, "exit_code: 1", "failure")])
-
-    result = run_agent(llm, executor, max_verification_requests=0)("Run tests.")
-
-    assert result.status is AgentStatus.VERIFICATION_REQUIRED
-    assert len(result.verification_evidence) == 1
-    assert not result.verification_evidence[0].success
-    observation = json.loads(llm.calls[1]["messages"][-1]["content"])
-    assert observation["error"] == "failure"
+    assert result.status is AgentStatus.COMPLETED
+    assert result.plan_history[0].steps[0].status is PlanStepStatus.COMPLETED
+    assert len(executor.calls[1:]) == 2
 
 
-def test_max_verification_requests_prevents_loop() -> None:
-    llm = FakeLLM(
-        [
-            final_response("Done."),
-            final_response("Done again."),
-            final_response("Still done."),
-        ]
-    )
+def test_four_early_final_answers_return_plan_failed_after_three_reminders() -> None:
+    llm = FakeLLM([
+        plan_response([planned_step("read", "read_file", {"path": "a.py"})]),
+        final_response(), final_response(), final_response(), final_response(),
+    ])
 
-    result = run_agent(llm, max_verification_requests=2)("Implement a feature.")
+    result = run_agent(llm, max_plan_completion_reminders=3)("Explain a.py.")
 
-    assert result.status is AgentStatus.VERIFICATION_REQUIRED
-    assert result.steps == 3
+    assert result.status is AgentStatus.PLAN_FAILED
+    assert result.plan_history[0].steps[0].status is PlanStepStatus.PENDING
 
 
-def test_max_steps_prevents_infinite_tool_loop() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(tool_call("one", "list_files", {"path": "."})),
-            tool_response(tool_call("two", "list_files", {"path": "."})),
-        ]
-    )
-    executor = FakeExecutor([ToolResult(True, "files"), ToolResult(True, "files")])
+def test_verification_before_write_becomes_stale_until_final_verification() -> None:
+    steps = [
+        planned_step("verify_old", "execute_command", {"command": ["pytest"]}),
+        planned_step("write", "write_file", {"path": "a.py"}),
+        planned_step("verify_new", "execute_command", {"command": ["pytest"]}),
+    ]
+    llm = FakeLLM([
+        plan_response(steps),
+        tool_response(
+            tool_call("v1", "execute_command", {"command": ["pytest"]}),
+            tool_call("w", "write_file", {"path": "a.py", "content": "x"}),
+        ),
+        final_response("Too early."),
+        tool_response(tool_call("v2", "execute_command", {"command": ["pytest"]})),
+        final_response("Verified."),
+    ])
+    executor = FakeExecutor([
+        ToolResult(True, "passed"), ToolResult(True, "wrote"), ToolResult(True, "passed")
+    ])
 
-    result = run_agent(llm, executor, max_steps=2)("Inspect this unusual project task.")
+    result = run_agent(llm, executor)("Fix a.py.")
+
+    assert result.status is AgentStatus.COMPLETED
+    assert [item.workspace_revision for item in result.verification_evidence] == [0, 1]
+
+
+def test_failed_verification_is_evidence_and_step_remains_pending() -> None:
+    steps = [planned_step("verify", "execute_command", {"command": ["pytest"]})]
+    llm = FakeLLM([
+        plan_response(steps),
+        tool_response(tool_call("v", "execute_command", {"command": ["pytest"]})),
+    ])
+    executor = FakeExecutor([ToolResult(False, "exit_code: 1", "failed")])
+
+    result = run_agent(llm, executor, max_steps=1)("Run the tests.")
 
     assert result.status is AgentStatus.MAX_STEPS_REACHED
-    assert result.steps == 2
+    assert result.verification_evidence[0].success is False
+    assert result.plan_history[0].steps[0].status is PlanStepStatus.PENDING
 
 
-def test_successful_verification_becomes_stale_after_later_write() -> None:
-    llm = FakeLLM(
-        [
-            tool_response(
-                tool_call("test", "execute_command", {"command": ["pytest"]}),
-                tool_call("write", "write_file", {"path": "a.py", "content": "new"}),
-            ),
-            final_response("Done."),
-        ]
+def test_max_verification_requests_remains_bounded_as_defensive_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    injected_plan = TaskPlan(
+        goal="Injected runtime fallback scenario",
+        success_criteria=["Write completes"],
+        steps=[PlanStep(
+            id="write",
+            description="Write a file",
+            tool="write_file",
+            argument_constraints={"path": "a.py"},
+            rationale="Exercise post-plan verification fallback",
+        )],
+        revision=0,
     )
-    executor = FakeExecutor(
-        [ToolResult(True, "exit_code: 0"), ToolResult(True, "wrote")]
-    )
+    monkeypatch.setattr("agent.parse_plan", lambda *args, **kwargs: injected_plan)
+    llm = FakeLLM([
+        plan_response([]),
+        tool_response(tool_call("w", "write_file", {"path": "a.py", "content": "x"})),
+        final_response(), final_response(),
+    ])
+    executor = FakeExecutor([ToolResult(True, "wrote")])
 
-    result = run_agent(llm, executor, max_verification_requests=0)("Fix a.py.")
+    result = run_agent(llm, executor, max_verification_requests=1)(
+        "Perform the requested operation."
+    )
 
     assert result.status is AgentStatus.VERIFICATION_REQUIRED
-    assert result.verification_evidence[0].workspace_revision == 0
 
 
-def test_llm_failure_is_fatal() -> None:
-    llm = FakeLLM([])
+def test_max_steps_and_fatal_errors_remain_distinct() -> None:
+    llm = FakeLLM([
+        plan_response([planned_step("read", "read_file", {"path": "a.py"})]),
+        tool_response(tool_call("read", "read_file", {"path": "a.py"})),
+    ])
+    result = run_agent(llm, FakeExecutor([ToolResult(True, "content")]), max_steps=1)(
+        "Explain a.py."
+    )
+    assert result.status is AgentStatus.MAX_STEPS_REACHED
 
-    result = run_agent(llm)("Inspect and explain the workspace.")
+    fatal = run_agent(FakeLLM([RuntimeError("network down")]))("Explain this project.")
+    assert fatal.status is AgentStatus.FATAL_ERROR
 
-    assert result.status is AgentStatus.FATAL_ERROR
-    assert "LLM communication" in result.error
+    execution_fatal = run_agent(FakeLLM([
+        plan_response([]), RuntimeError("protocol failure")
+    ]))("Explain this project.")
+    assert execution_fatal.status is AgentStatus.FATAL_ERROR
+
+    malformed = run_agent(FakeLLM([
+        plan_response([]), {"role": "user", "content": "wrong role"}
+    ]))("Explain this project.")
+    assert malformed.status is AgentStatus.FATAL_ERROR
+
+
+def test_invalid_tool_json_is_observed_without_executor_call() -> None:
+    plan = plan_response([planned_step("read", "read_file", {"path": "a.py"})])
+    llm = FakeLLM([
+        plan,
+        tool_response(tool_call("bad", "read_file", "{not-json")),
+        tool_response(tool_call("good", "read_file", {"path": "a.py"})),
+        final_response(),
+    ])
+    executor = FakeExecutor([ToolResult(True, "content")])
+
+    result = run_agent(llm, executor)("Explain a.py.")
+
+    assert result.status is AgentStatus.COMPLETED
+    assert executor.calls[1:] == [("read_file", {"path": "a.py"})]
+    observation = json.loads(llm.calls[2]["messages"][-1]["content"])
+    assert observation["success"] is False
+    assert "Invalid JSON" in observation["error"]
 
 
 @pytest.mark.parametrize(
     ("task", "expected"),
     [
-        ("Explain what calculator.py does.", False),
+        ("Explain calculator.py.", False),
         ("Fix the calculator bug.", True),
-        ("Create a calculator module.", True),
-        ("Run the tests and verify the result.", True),
-        ("Help with this repository.", True),
-        ("解释这个项目的作用。", False),
-        ("修复这个项目。", True),
+        ("Create a module.", True),
+        ("解释这个项目。", False),
+        ("实现最短路径算法。", True),
     ],
 )
 def test_task_requires_verification_rules(task: str, expected: bool) -> None:
@@ -456,7 +485,7 @@ def test_task_requires_verification_rules(task: str, expected: bool) -> None:
         (["python", "-m", "pytest"], True),
         (["python", "smoke.py"], True),
         (["git", "status"], False),
-        (["git", "diff"], False),
+        (["pytest", "-v"], False),
         ("pytest", False),
     ],
 )
