@@ -360,6 +360,35 @@ def _workspace_git_directory(root: Path) -> Path:
     return git_directory.resolve(strict=True)
 
 
+def _workspace_pytest_command(root: Path) -> list[str]:
+    config_names = (
+        "pytest.ini",
+        ".pytest.ini",
+        "pyproject.toml",
+        "tox.ini",
+        "setup.cfg",
+    )
+    config = next(
+        (
+            root / name
+            for name in config_names
+            if (root / name).is_file() and not (root / name).is_symlink()
+        ),
+        None,
+    )
+    return [
+        sys.executable,
+        "-m",
+        "pytest",
+        "--rootdir",
+        str(root),
+        "--confcutdir",
+        str(root),
+        "-c",
+        str(config) if config is not None else os.devnull,
+    ]
+
+
 def _validate_command(command: list[str]) -> tuple[list[str], Path]:
     if not isinstance(command, list) or not command:
         raise ToolInputError("Command must be a non-empty list of strings.")
@@ -371,7 +400,7 @@ def _validate_command(command: list[str]) -> tuple[list[str], Path]:
     root = _root()
     if command[0] == "python":
         if command[1:] == ["-m", "pytest"]:
-            return [sys.executable, "-m", "pytest"], root
+            return _workspace_pytest_command(root), root
         if len(command) != 2:
             raise ToolInputError(
                 "Only 'python <workspace script.py>' or 'python -m pytest' is allowed."
@@ -384,7 +413,7 @@ def _validate_command(command: list[str]) -> tuple[list[str], Path]:
         return [sys.executable, str(script)], root
 
     if command == ["pytest"]:
-        return [sys.executable, "-m", "pytest"], root
+        return _workspace_pytest_command(root), root
     if command in (["git", "status"], ["git", "diff"]):
         git = _trusted_git_executable(root)
         git_directory = _workspace_git_directory(root)

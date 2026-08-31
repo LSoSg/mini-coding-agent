@@ -1,18 +1,24 @@
-# Lightweight Coding Agent（v0.2）
+# Lightweight Coding Agent（v0.3）
 
-v0.2 在 v0.1 的通义千问调用能力之外，新增了一个独立的 Local Tool Layer，用于在项目的 `workspace/` 目录内安全地执行有限的文件操作和本地命令。
+v0.3 将阿里云百炼 OpenAI-compatible LLM Client 与本地 Tool Layer 连接为一个最小 Tool-Calling Coding Agent，并使用真实命令结果实现 Verification-aware termination。
 
-当前版本仍然不是 Agent：工具层尚未接入 LLM，不包含 Tool Calling、Agent Loop、Planning、Reflection、Context Manager、Verification、Patch Editing、多 Agent 或 Git 自动修改。
+```text
+User Task → LLM → Tool Call → Safe Local Tool → Observation → LLM
+                                                       ↓
+                                      Verification Evidence → Final Status
+```
 
-## 环境要求
+## 当前能力
 
-- Conda
-- Python 3.10 或更高版本
-- 阿里云百炼 API Key（仅运行 v0.1 模型调用 CLI 时需要）
+- 通过百炼调用通义千问 Chat Completions。
+- 维护标准 assistant/tool message history。
+- 支持 `list_files`、`search_files`、`read_file`、`write_file` 和 `execute_command`。
+- 顺序执行单轮响应中的全部 Tool Calls。
+- 将统一 `ToolResult` 序列化为 JSON observation。
+- 记录真实验证证据，拒绝无验证或验证失败后的虚假完成声明。
+- 使用 `MAX_STEPS` 和 `MAX_VERIFICATION_REQUESTS` 防止无限循环。
 
 ## 安装
-
-创建并激活 Conda 环境：
 
 ```bash
 conda create --name coding-agent python=3.10
@@ -20,9 +26,7 @@ conda activate coding-agent
 python -m pip install -r requirements.txt
 ```
 
-## 模型配置与 CLI
-
-复制 `.env.example` 为 `.env`，然后填写 API Key：
+复制 `.env.example` 为 `.env`，填写百炼 API Key：
 
 ```text
 DASHSCOPE_API_KEY=你的_API_Key
@@ -30,76 +34,79 @@ LLM_BASE_URL=
 LLM_MODEL=
 ```
 
-`LLM_BASE_URL` 和 `LLM_MODEL` 留空时，分别使用：
+后两项留空时默认使用：
 
 - `https://dashscope.aliyuncs.com/compatible-mode/v1`
 - `qwen-plus`
 
-运行模型调用 CLI：
+不要提交包含真实密钥的 `.env`。
+
+## 运行 Agent
+
+将待处理代码放入 `workspace/`，然后运行：
 
 ```bash
-python main.py "你好，请介绍一下你自己"
+python main.py "Inspect the workspace and tell me what this project does."
 ```
 
-不要提交包含真实密钥的 `.env` 文件。
+代码修改任务示例：
 
-## Local Tool Layer
-
-`tools.py` 提供 5 个工具：
-
-- `list_files`：列出目录，并区分文件、目录、符号链接和其他条目。
-- `search_files`：递归搜索常见 UTF-8 代码及文本文件。
-- `read_file`：读取带长度限制的 UTF-8 普通文件。
-- `write_file`：写入 UTF-8 普通文件，并按需创建父目录。
-- `execute_command`：验证并执行严格白名单中的本地命令。
-
-所有工具只访问 `tools.py` 同级的 `workspace/` 目录，并统一返回：
-
-```python
-ToolResult(success: bool, output: str = "", error: str | None = None)
+```bash
+python main.py "The tests are failing. Find the bug and fix it without modifying the tests."
 ```
 
-可以通过注册表统一分发：
+CLI 会显示每个 Agent step、工具名称、隐藏具体写入内容后的参数摘要、工具成功状态、验证证据和最终状态。可能的状态包括：
 
-```python
-from tools import execute_tool
+- `COMPLETED`：信息任务已回答，或当前代码已有成功验证证据。
+- `VERIFICATION_REQUIRED`：代码任务没有获得当前有效的成功验证。
+- `MAX_STEPS_REACHED`：达到 Agent step 上限。
+- `FATAL_ERROR`：LLM、配置或消息协议发生无法继续的错误。
 
-result = execute_tool("read_file", {"path": "README.md"})
-```
+## Tool Schema 与本地注册表
 
-## 命令白名单
+`tool_schemas.py` 中的 `TOOLS` 是 OpenAI-compatible JSON Schema，只负责告诉 LLM 可用工具及参数。
 
-v0.2 只接受以下参数列表：
+`tools.py` 中的 `TOOL_REGISTRY` 将工具名称映射到本地 Python 函数，只负责实际分发。模型生成的调用必须经过：
 
 ```text
-["python", "<workspace 内的脚本.py>"]
-["python", "-m", "pytest"]
-["pytest"]
-["git", "status"]
-["git", "diff"]
+LLM Tool Call
+    → JSON arguments parser
+    → execute_tool
+    → Tool Layer 路径/命令安全检查
+    → LocalEnvironment
 ```
 
-命令不会经过 shell；不支持管道、重定向、命令拼接或额外参数。`python` 和 `pytest` 使用当前虚拟环境的 Python 解释器执行。
+Agent 不直接访问文件系统，也不直接调用 subprocess。
 
-## 安全边界
+## Verification-aware termination
 
-- 工具路径必须是 workspace 内的相对路径。
-- 拒绝绝对路径、`..`、Windows 保留路径和路径中的符号链接。
-- 解析后的路径必须仍位于 workspace 内。
-- Agent 项目源码位于 workspace 之外，文件类工具不能直接读取或修改它。
-- 搜索跳过 `.git`、`.venv`、`venv`、`node_modules`、`__pycache__` 和非 UTF-8 文件。
-- 文件内容、搜索结果、命令输出和错误信息均有限长。
-- subprocess 固定使用 workspace 作为 `cwd`，设置 30 秒超时，并明确使用 `shell=False`。
-- 命令策略与 subprocess 执行分别位于 `tools.py` 和 `local_environment.py`。
-- `git status/diff` 要求 `workspace/.git` 是真实目录，并显式绑定该 Git 目录和工作树，不会向上使用 Agent 自身仓库。
+涉及创建、实现、修改、修复、重构、测试、构建或验证的任务需要验证。明确的查看、读取、列出、解释或描述任务不强制验证；模糊任务默认要求验证。
 
-这是一层进程内路径与命令策略，不是操作系统沙箱。被允许执行的 Python 脚本和 pytest 测试本身仍可运行任意 Python 代码，也可能主动访问 workspace 外的文件，包括 Agent 项目源码。因此 workspace 中的可执行代码必须视为可信代码；若需要强进程隔离，应在后续版本引入容器、受限系统用户或其他操作系统级沙箱。
+成功执行以下当前白名单命令可产生验证证据：
 
-`workspace/` 的运行内容默认被外层 Agent 仓库忽略；`.gitkeep` 仅用于在克隆 Agent 项目后保留空目录。如果需要使用 `git status` 或 `git diff`，应将目标 Git 仓库克隆到 `workspace/`，或在该目录中初始化独立仓库。
+```text
+["pytest"]
+["python", "-m", "pytest"]
+["python", "<workspace 内的脚本.py>"]
+```
 
-## 自动创建父目录
+`git status` 和 `git diff` 是信息命令，不是验证证据。失败的测试会被记录为失败证据并返回模型，但不会立即终止 Agent。
 
-`write_file` 会自动创建目标文件的父目录，使后续 Coding Agent 可以创建新的模块或目录结构，而不需要额外开放一个目录创建工具。创建前后都会重新进行 workspace 和符号链接检查。
+每次成功 `write_file` 都会增加 workspace revision。成功验证只对当时 revision 有效；验证成功后再次写文件，必须重新验证。只有最后一条验证成功且对应当前 revision，代码任务才能返回 `COMPLETED`。
+
+模型文字中的“测试通过”不构成验证证据。证据只能来自真实 `execute_tool("execute_command", ...)` 返回的 `ToolResult`。
+
+## Local Tool Layer 安全边界
+
+- 文件工具只接受 `workspace/` 内相对路径。
+- 拒绝绝对路径、`..`、保留系统路径和路径中的符号链接。
+- 搜索跳过依赖、Git、缓存目录和非 UTF-8 文件。
+- 文件、搜索、命令和错误输出均有限长。
+- 命令以参数列表执行，固定 workspace `cwd`，30 秒超时，`shell=False`。
+- 只允许 `python <script.py>`、pytest、`git status` 和 `git diff`。
+- Git 命令要求 workspace 拥有自己的 `.git`，不会向上使用 Agent 仓库。
+
+这不是操作系统沙箱。被允许的 Python 脚本和 pytest 测试自身可以运行任意 Python 代码，甚至主动访问 workspace 外的文件，因此只应执行可信代码。强隔离需要后续引入容器或受限系统用户。
 
 ## 测试
 
@@ -107,13 +114,67 @@ v0.2 只接受以下参数列表：
 python -m pytest -q
 ```
 
-测试使用 pytest 的 `tmp_path`，不会读写真实项目 workspace。覆盖正常文件操作、路径越界、路径穿越、符号链接、UTF-8 错误、输出截断、命令白名单、非零退出、超时和注册表异常隔离。
+测试使用 Fake LLM，不调用真实百炼 API；Tool Layer 测试使用 `tmp_path`，不修改真实 workspace。
+
+如果 Windows 上出现旧 pytest 缓存目录的 `WinError 5`，可以临时绕过该缓存：
+
+```bash
+mkdir -p tmp
+python -m pytest -q --basetemp=tmp/pytest-user -p no:cacheprovider
+```
+
+## 手动 End-to-End：修复代码
+
+在 `workspace/calculator.py` 中准备一个错误实现：
+
+```python
+def add(a, b):
+    return a - b
+```
+
+在 `workspace/test_calculator.py` 中准备测试：
+
+```python
+from calculator import add
+
+
+def test_add():
+    assert add(2, 3) == 5
+```
+
+运行：
+
+```bash
+python main.py "The tests are failing. Find the bug and fix it without modifying the tests."
+```
+
+理想轨迹为读取文件、修复实现、执行 pytest、获得成功证据，然后返回 `COMPLETED`。
+
+## 手动 End-to-End：从零创建代码
+
+清空 workspace 中除 `.gitkeep` 外的任务文件，然后运行：
+
+```bash
+python main.py "Create calculator.py with add, subtract, multiply and divide functions. Also create pytest tests and run them to verify the implementation."
+```
+
+理想轨迹为创建实现和测试、执行 pytest、获得成功证据，然后返回 `COMPLETED`。
 
 ## 文件职责
 
-- `config.py`：读取和校验模型环境变量。
-- `llm.py`：封装普通 Chat Completions 调用。
-- `main.py`：提供单轮模型调用 CLI。
-- `tools.py`：定义统一工具结果、路径与命令安全策略、5 个工具和工具注册表。
-- `local_environment.py`：执行已经通过校验的 subprocess 参数列表并返回原始执行结果。
-- `tests/test_tools.py`：使用临时 workspace 验证 Local Tool Layer。
+- `config.py`：加载和校验模型配置。
+- `llm.py`：发送 Chat Completions；普通模式返回文本，Tool Calling 模式返回 assistant message。
+- `tool_schemas.py`：定义暴露给 LLM 的 OpenAI-compatible Tool Schema。
+- `agent.py`：维护消息、执行 Agent Loop、记录验证证据并决定终止状态。
+- `tools.py`：提供统一 `ToolResult`、工具安全策略、实际工具和注册表。
+- `local_environment.py`：执行已经通过安全校验的 subprocess 参数列表。
+- `main.py`：处理 CLI 输入并展示 Agent 返回的状态和结果。
+- `pytest.ini`：限制 Agent 项目的测试发现范围，避免收集 workspace 和临时目录。
+- `tests/test_agent.py`：Fake LLM Agent Loop 与验证终止测试。
+- `tests/test_llm.py`：LLMClient 普通/Tool Calling 返回模式测试。
+- `tests/test_tool_schemas.py`：Schema 与本地函数签名一致性测试。
+- `tests/test_tools.py`：Local Tool Layer 安全和功能测试。
+
+## v0.3 明确不包含
+
+Planning、Reflection、Replanning、Working Memory、Context trimming、摘要、Patch/AST Editing、trajectory logger、token/cost 统计、Human confirmation、多 Agent、RAG、Web UI、Docker sandbox、额外验证 Agent、自动 Git commit 或 push。

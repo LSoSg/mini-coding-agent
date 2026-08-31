@@ -1,7 +1,7 @@
 """Minimal client for an OpenAI-compatible chat completion API."""
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, overload
 
 from openai import OpenAI, OpenAIError
 
@@ -28,20 +28,46 @@ class LLMClient:
                 f"{exc}"
             ) from exc
 
-    def chat(self, messages: Sequence[Mapping[str, Any]]) -> str:
-        """Send standard Chat Completions messages and return response text."""
+    @overload
+    def chat(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: None = None,
+    ) -> str: ...
+
+    @overload
+    def chat(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+    ) -> Any: ...
+
+    def chat(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]] | None = None,
+    ) -> str | Any:
+        """Send messages and return text or an assistant tool-calling message."""
+        request: dict[str, Any] = {
+            "model": self.settings.model,
+            "messages": list(messages),
+        }
+        if tools is not None:
+            request["tools"] = list(tools)
+
         try:
-            completion = self._client.chat.completions.create(
-                model=self.settings.model,
-                messages=list(messages),
-            )
+            completion = self._client.chat.completions.create(**request)
         except OpenAIError as exc:
             raise LLMError(f"模型请求失败：{exc}") from exc
 
         if not completion.choices:
             raise LLMError("模型返回异常：响应中没有可用选项。")
 
-        content = completion.choices[0].message.content
+        message = completion.choices[0].message
+        if tools is not None:
+            return message
+
+        content = message.content
         if not isinstance(content, str) or not content.strip():
             raise LLMError("模型返回异常：响应内容为空。")
 
