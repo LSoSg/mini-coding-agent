@@ -21,6 +21,9 @@ def print_result(result: AgentResult) -> None:
     print("[Final]")
     print(result.final_answer)
 
+    if result.verification_level is not None:
+        print(f"\n[Verification level] {result.verification_level.value}")
+
     print("\n[Plan History]")
     if not result.plan_history:
         print("- No valid plan was accepted.")
@@ -43,9 +46,12 @@ def print_result(result: AgentResult) -> None:
         for evidence in result.verification_evidence:
             state = "passed" if evidence.success else "failed"
             print(
-                f"- Step {evidence.step}, revision {evidence.workspace_revision}: "
+                f"- [{evidence.tier.value}] Step {evidence.step}, "
+                f"revision {evidence.workspace_revision}: "
                 f"{evidence.command}: {state}"
             )
+            if evidence.tier.value == "ORIGINAL" and evidence.output:
+                print(evidence.output)
 
     if result.error and result.status is not AgentStatus.COMPLETED:
         print(f"\n[Reason] {result.error}")

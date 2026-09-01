@@ -1,32 +1,28 @@
-# Lightweight Coding Agent（v0.4）
+# Lightweight Coding Agent（v0.5）
 
-v0.4 在 v0.3 的 Tool-Calling Agent Loop 前加入强制结构化规划，并用计划约束每一次本地工具调用。
+v0.5 在 v0.4 的显式计划和安全 Tool Layer 之上，增加 workspace 快照与原测试回归验证。
+
+它解决的问题是：
+
+> Agent 自己编写或修改的测试通过，不等于实现真的正确。
+
+Agent 仍然可以正常修改源码和测试，但最终验证会使用任务开始时快照中的原测试。修改断言、删除测试或调整 pytest 配置，不能让原测试回归得到通过。
 
 ```text
 用户任务
-  → 受控 workspace 根目录清单
-  → 无工具的结构化规划
-  → 计划匹配器
-  → Local Tool Layer
-  → Observation / 有限重规划
-  → 计划完成 + 当前 revision 验证成功
-  → 最终回答
-```
-
-Agent 只能访问项目下的 `workspace/`。规划层不替代 v0.2 的路径与命令安全检查；工具调用的完整链路是：
-
-```text
-LLM Tool Call
-  → Agent 计划匹配
-  → execute_tool / TOOL_REGISTRY
-  → Tool Layer 路径与命令安全检查
-  → LocalEnvironment
-  → subprocess（shell=False）
+  → 初始 workspace 快照与原测试发现
+  → 显式计划
+  → Agent 修改代码/测试
+  → SELF 自验证
+  → 模型 final
+  → 临时副本恢复原测试
+  → ORIGINAL 回归验证
+  → 分层终止状态
 ```
 
 ## 安装
 
-推荐使用 Conda 创建独立环境：
+推荐使用 Conda：
 
 ```bash
 conda create --name coding-agent python=3.10
@@ -34,7 +30,7 @@ conda activate coding-agent
 python -m pip install -r requirements.txt
 ```
 
-复制 `.env.example` 为 `.env`，并填写百炼 API Key：
+复制 `.env.example` 为 `.env`：
 
 ```text
 DASHSCOPE_API_KEY=你的_API_Key
@@ -42,127 +38,111 @@ LLM_BASE_URL=
 LLM_MODEL=
 ```
 
-后两项留空时使用默认值：
+后两项留空时默认使用：
 
-- Base URL：`https://dashscope.aliyuncs.com/compatible-mode/v1`
-- Model：`qwen-plus`
+- `https://dashscope.aliyuncs.com/compatible-mode/v1`
+- `qwen-plus`
 
 不要提交包含真实密钥的 `.env`。
 
-如果 Windows/Conda 中曾设置无效的 `SSL_CERT_FILE`，OpenAI 客户端初始化可能报 `FileNotFoundError`。请删除该无效环境变量，或将它改为当前 Conda 环境中真实存在的 CA 文件路径；不要在代码中关闭 SSL 校验。
+如果 Windows/Conda 中的 `SSL_CERT_FILE` 指向不存在的文件，OpenAI 客户端可能在初始化时报 `FileNotFoundError`。请删除该无效环境变量，或将它改为当前 Conda 环境中真实存在的 CA 文件；不要关闭 SSL 校验。
 
 ## 运行
 
-先把待处理代码放入 `workspace/`，再运行：
+把待处理项目放入 `workspace/`：
 
 ```bash
-python main.py "Inspect the workspace and tell me what this project does."
+python main.py "Fix the bug and verify the implementation."
 ```
 
-代码创建任务示例：
-
-```bash
-python main.py "请实现标准的 Dijkstra 最短路径算法，并编写测试进行验证。"
-```
-
-CLI 会输出根目录预检、初始计划、计划偏离、重规划、工具结果、验证证据、最终状态以及完整 Plan History。`write_file.content` 不会出现在计划或参数日志中。
-
-## 结构化计划协议
-
-规划和执行使用同一个 LLM，但规划请求不携带 `tools`。模型必须返回严格 JSON：
-
-```json
-{
-  "goal": "实现标准 Dijkstra 算法并验证",
-  "success_criteria": [
-    "生成 dijkstra.py",
-    "测试通过"
-  ],
-  "steps": [
-    {
-      "id": "step_1",
-      "description": "创建算法实现",
-      "tool": "write_file",
-      "argument_constraints": {"path": "dijkstra.py"},
-      "rationale": "这是用户要求的目标文件"
-    },
-    {
-      "id": "step_2",
-      "description": "创建测试",
-      "tool": "write_file",
-      "argument_constraints": {"path": "test_dijkstra.py"},
-      "rationale": "提供可执行的正确性验证"
-    },
-    {
-      "id": "step_3",
-      "description": "运行完整测试",
-      "tool": "execute_command",
-      "argument_constraints": {"command": ["python", "-m", "pytest"]},
-      "rationale": "获得真实验证证据"
-    }
-  ]
-}
-```
-
-程序会校验字段、步骤 ID、工具名、真实工具参数、workspace 相对路径、命令白名单、步骤上限和验证顺序。`write_file` 计划只保存 `path`，完整 `content` 在执行时生成，不参与计划匹配。
-
-默认边界：
-
-- 最多 2 次计划生成/纠错尝试；
-- 最多接受 2 次重规划；
-- 每份计划最多 12 个步骤；
-- 模型提前返回 final 时最多提醒 3 次；
-- Agent Loop 最多 20 步；
-- 所有任务都先规划，纯信息任务可以生成零工具步骤计划。
-
-## 计划约束与重规划
-
-执行时只允许匹配当前 pending step 的工具调用：工具名必须相同，`path`、`keyword`、`command` 等约束必须匹配。默认参数会在匹配前规范化；`write_file.content` 例外。
-
-一个 assistant response 包含多个 Tool Calls 时，它们必须依次匹配连续计划步骤。任意一个调用偏离，整批都不会执行，每个 `tool_call_id` 都会收到结构化失败 observation，然后进入无工具的重规划调用。
-
-工具成功后对应步骤才会变为 `COMPLETED`。工具失败会作为 observation 返回模型，步骤保持 `PENDING`，允许模型修正并重试。历史计划及其完成状态不会被覆盖。
-
-## Verification-aware termination
-
-`COMPLETED` 同时要求：
-
-- 当前计划的所有步骤成功完成；
-- 模型返回无 Tool Call 的最终文本；
-- 需要验证的任务已有成功验证证据；
-- 最近验证对应当前 workspace revision。
-
-每次成功 `write_file` 都会增加 workspace revision。验证成功后再次写入文件，会使旧验证失效，必须重新验证。以下命令可产生验证证据：
+v0.5 不要求固定项目布局，以下形式都可以：
 
 ```text
-["pytest"]
-["python", "-m", "pytest"]
-["python", "<workspace 内脚本.py>"]
+workspace/                 workspace/
+├── app.py                 ├── src/
+└── test_app.py            └── tests/
 ```
 
-`git status` 和 `git diff` 只是信息命令，不构成验证证据。模型文字中的“测试通过”也不构成证据。
+CLI 会显示快照状态、原测试发现结果、计划历史、自验证证据、原测试完整输出和最终验证等级。
 
-最终状态包括：
+## Workspace 快照
 
-- `COMPLETED`：计划完成，并满足必要的真实验证条件；
-- `PLAN_FAILED`：无法获得合法计划、超过重规划次数，或反复跳过未完成计划；
-- `VERIFICATION_REQUIRED`：当前 workspace revision 缺少成功验证；
+每次有效任务在第一次规划调用前都会保存 workspace 临时副本，并跳过：
+
+- `.git`；
+- `.venv`、`venv`；
+- `node_modules`；
+- `__pycache__`、`.pytest_cache`；
+- `.pyc` 和 `.pyo` 文件。
+
+快照不修改真实 workspace，并在 Agent 本次运行结束后清理。快照复制失败属于 `FATAL_ERROR`，不会退回无快照执行。
+
+快照中会通过受限的 pytest `--collect-only` 发现任务开始时真实可收集的测试文件，因此支持根目录测试、`tests/` 布局和自定义 `python_files` 配置。
+
+如果原项目存在导入错误或 pytest 配置错误，导致测试发现失败，Agent 仍可尝试修复，但最终最高只能达到 `SELF_VERIFIED`。
+
+## SELF 与 ORIGINAL
+
+### SELF
+
+Agent 通过 `execute_command` 运行的 pytest 或 Python 脚本都属于 `SELF`：
+
+- 测试可能由 Agent 自己生成；
+- 已有测试可能已被 Agent 修改；
+- 结果只能证明“当前实现和当前测试相互一致”。
+
+### ORIGINAL
+
+模型返回 final 后，外层程序创建一个新的临时验证副本：
+
+1. 复制 Agent 最终 workspace；
+2. 删除最终版本中的 pytest 配置与 `conftest.py`；
+3. 恢复初始快照中的原测试、原配置、fixture 和 helper；
+4. 显式运行任务开始时收集到的测试文件；
+5. 不把结果反馈给模型，也不进入自动修复循环；
+6. 验证完成后删除临时副本。
+
+Agent 新增的测试不会进入 ORIGINAL 回归。对于常规 `tests/` 或 `test/` 目录，整个原测试目录都会恢复，以避免通过修改 helper 或 fixture 改变断言语义。
+
+原测试输出会显示给终端用户，但限制为 20,000 字符，并将临时绝对路径替换为占位符。
+
+## 终止状态
+
+- `COMPLETED`：信息任务正常结束，或者最终代码通过 ORIGINAL 回归；
+- `SELF_VERIFIED`：SELF 验证通过，但初始 workspace 没有可运行原测试，或原测试发现失败；
+- `ORIGINAL_TESTS_FAILED`：SELF 验证通过，但初始快照中的原测试在最终代码上失败；
+- `VERIFICATION_REQUIRED`：当前 workspace revision 缺少成功 SELF 验证；
+- `PLAN_FAILED`：无法获得或遵循合法计划；
 - `MAX_STEPS_REACHED`：达到 Agent Loop 步数上限；
-- `FATAL_ERROR`：LLM API 或消息协议出现无法继续的错误。
+- `FATAL_ERROR`：LLM、快照或外层 runner 出现无法继续的异常。
 
-计划 JSON 错误是可恢复的规划错误，不会直接归类为 `FATAL_ERROR`。
+验证等级：
 
-## Local Tool Layer 安全边界
+```text
+SELF < ORIGINAL
+```
 
-- 文件工具只接受 `workspace/` 内的相对路径；
-- 拒绝绝对路径、`..`、保留系统路径和路径中的符号链接；
-- 搜索跳过依赖、Git、缓存目录和非 UTF-8 文件；
-- 文件、搜索、命令和错误输出均限制长度；
-- 命令以参数列表执行，固定 workspace `cwd`、30 秒超时、`shell=False`；
-- 只允许 `python <script.py>`、`pytest`、`git status` 和 `git diff` 的既定形式；
-- Git 命令要求 workspace 拥有自己的 `.git`，不会向上使用 Agent 项目的仓库。
+CLI exit code：
 
-这不是操作系统级沙箱。被允许的 Python 脚本和 pytest 测试本身可以运行任意 Python 代码，因此只应在 workspace 中放置可信代码。更强隔离需在后续版本引入容器或受限系统账户。
+- `COMPLETED`：0；
+- `FATAL_ERROR`：1；
+- 其他状态：2。
+
+## 显式计划与安全工具层
+
+所有任务仍然先生成严格 JSON 计划。规划请求不携带 tools；执行阶段只允许按顺序匹配当前计划步骤的 Tool Call，最多接受两次重规划。
+
+工具调用仍经过：
+
+```text
+Agent plan matcher
+  → execute_tool / TOOL_REGISTRY
+  → 路径与命令安全检查
+  → LocalEnvironment
+  → subprocess（shell=False）
+```
+
+Agent 只能通过工具访问 `workspace/`，命令仍限定为 `python <script.py>`、pytest、`git status` 和 `git diff` 的既定形式。
 
 ## 测试
 
@@ -170,49 +150,34 @@ CLI 会输出根目录预检、初始计划、计划偏离、重规划、工具�
 python -m pytest -q
 ```
 
-该命令按 `pytest.ini` 收集 `tests/` 下的测试，包括 `tests/test_agent.py`、`tests/test_planning.py`、LLM/Schema 测试和原有 Tool Layer 测试。测试使用 Fake LLM，不调用真实百炼 API；Tool Layer 测试使用临时目录，不修改真实 workspace。
+测试使用 Fake LLM 和 `tmp_path`，不会调用真实百炼 API，也不会修改真实 workspace。覆盖内容包括：
 
-如果 Windows 上遇到旧 pytest 缓存目录的 `WinError 5`，可执行：
+- v0.2 Tool Layer 安全边界；
+- v0.4 规划、重规划和 verification-aware termination；
+- 快照创建、忽略规则和清理；
+- pytest 原测试发现；
+- 原断言、删除测试、pytest 配置、helper 和 conftest 恢复；
+- SELF/ORIGINAL 证据及终止状态。
+
+Windows 若遇到旧 pytest 缓存目录的 `WinError 5`，可运行：
 
 ```bash
 mkdir -p tmp
 python -m pytest -q --basetemp=tmp/pytest-user -p no:cacheprovider
 ```
 
-## Dijkstra 回归验收
-
-在 workspace 中保留无关的 `calculator.py` 和 `test_calculator.py`，然后运行 Dijkstra 创建任务。期望轨迹接近：
-
-```text
-root inventory
-→ explicit plan
-→ write dijkstra.py
-→ write test_dijkstra.py
-→ python -m pytest
-→ COMPLETED
-```
-
-验收重点：
-
-- 不读取 `calculator.py` 或 `test_calculator.py`；
-- 不尝试白名单之外的 pytest 参数；
-- 每个动作都能映射到一个计划步骤；
-- 最终成功同时具有完整计划和真实验证证据。
-
 ## 文件职责
 
-- `config.py`：加载并校验模型配置；
-- `llm.py`：发送 Chat Completions；无 tools 时返回文本，有 tools 时返回 assistant message；
-- `planning.py`：计划数据模型、严格 JSON 校验、参数规范化和计划匹配；
-- `agent.py`：规划、计划约束 Agent Loop、重规划、验证证据和终止状态；
-- `tool_schemas.py`：暴露给 LLM 的 OpenAI-compatible Tool Schema；
-- `tools.py`：统一 `ToolResult`、工具安全策略、实现与 `TOOL_REGISTRY`；
-- `local_environment.py`：执行已通过安全校验的 subprocess 参数列表；
-- `main.py`：处理 CLI 输入并展示状态、计划历史和结果；
-- `tests/test_planning.py`：结构化计划协议与匹配器测试；
-- `tests/test_agent.py`：Fake LLM 规划、执行、重规划和终止测试；
-- `tests/test_tools.py`：v0.2 Local Tool Layer 安全与功能回归测试。
+- `workspace_snapshot.py`：快照生命周期、原测试发现、验证副本和 ORIGINAL 回归；
+- `pytest_snapshot_worker.py`：独立 pytest 子进程中的收集与执行入口；
+- `agent.py`：规划、Agent Loop、SELF/ORIGINAL 证据和终止状态；
+- `planning.py`：严格计划 JSON 校验和步骤匹配；
+- `tools.py`：本地工具、安全策略和统一 `ToolResult`；
+- `local_environment.py`：执行已通过校验的 subprocess 参数列表；
+- `main.py`：CLI 和分层验证结果展示。
 
-## v0.4 明确不包含
+## v0.5 明确不包含
 
-Reflection、Working Memory、Context trimming、摘要、Patch/AST Editing、通用 Replanning 框架、Planner Agent、第二个模型、trajectory 文件日志、token/cost 统计、Human confirmation、多 Agent、RAG、Web UI、Docker sandbox、自动 Git commit 或 push。
+Hidden/Trusted Tests、测试文件写保护、逐工具完整性监控、容器、受限系统账户、Reflection、Working Memory、Patch Editing、多 Agent、自动修复循环、自动 Git commit 或 push。
+
+v0.5 不是操作系统级沙箱。被允许执行的 workspace Python 代码仍能运行任意 Python 逻辑，因此只应处理可信代码。

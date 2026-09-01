@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Protocol, Sequence
 
+import tools as tool_module
+
 from planning import (
     MAX_PLAN_COMPLETION_REMINDERS,
     MAX_PLANNING_ATTEMPTS,
@@ -22,6 +24,7 @@ from planning import (
 )
 from tool_schemas import TOOLS
 from tools import ToolResult, execute_tool
+from workspace_snapshot import WorkspaceSnapshot
 
 MAX_STEPS = 20
 MAX_VERIFICATION_REQUESTS = 3
@@ -51,14 +54,22 @@ class LLMChatClient(Protocol):
 
 class AgentStatus(str, Enum):
     COMPLETED = "COMPLETED"
+    SELF_VERIFIED = "SELF_VERIFIED"
+    ORIGINAL_TESTS_FAILED = "ORIGINAL_TESTS_FAILED"
     VERIFICATION_REQUIRED = "VERIFICATION_REQUIRED"
     MAX_STEPS_REACHED = "MAX_STEPS_REACHED"
     FATAL_ERROR = "FATAL_ERROR"
     PLAN_FAILED = "PLAN_FAILED"
 
 
+class VerificationTier(str, Enum):
+    SELF = "SELF"
+    ORIGINAL = "ORIGINAL"
+
+
 @dataclass
 class VerificationEvidence:
+    tier: VerificationTier
     command: str
     success: bool
     output: str
@@ -72,6 +83,7 @@ class AgentResult:
     status: AgentStatus
     final_answer: str
     verification_evidence: list[VerificationEvidence]
+    verification_level: VerificationTier | None
     plan_history: list[TaskPlan]
     steps: int
     messages: list[dict[str, Any]]
@@ -164,6 +176,40 @@ def _tool_result_payload(result: ToolResult) -> str:
     )
 
 
+def _verification_failure_reason(command: list[str], result: ToolResult) -> str:
+    """Build actionable replanning context from a failed verification result."""
+
+    command_text = " ".join(command)
+    diagnostics = f"{result.error or ''}\n{result.output or ''}".casefold()
+    is_pytest = command in (["pytest"], ["python", "-m", "pytest"])
+    no_tests_collected = any(
+        marker in diagnostics
+        for marker in (
+            "exit status 5",
+            "non-zero status 5",
+            "exit_code: 5",
+            "collected 0 items",
+            "no tests collected",
+            "no tests ran",
+        )
+    )
+    if is_pytest and no_tests_collected:
+        return (
+            f"The planned verification command {command_text} failed because pytest "
+            "collected no tests (exit code 5). Before running pytest again, create a "
+            "separate discoverable test module whose filename matches `test_*.py` "
+            "(for example, `test_floyd.py`). Merely adding `test_*` functions to a "
+            "normal source module such as `floyd.py` will not make pytest collect it."
+        )
+
+    return (
+        f"The planned verification command {command_text} failed: "
+        f"{result.error or 'see the tool result for diagnostics'}. Replace that failed "
+        "pending step with a plan that performs any necessary diagnosis or file repairs "
+        "before running verification again."
+    )
+
+
 def _safe_tool_call_summary(name: str, arguments: dict[str, Any]) -> str:
     safe_arguments = dict(arguments)
     if name == "write_file" and "content" in safe_arguments:
@@ -190,6 +236,7 @@ class CodingAgent:
         max_planning_attempts: int = MAX_PLANNING_ATTEMPTS,
         max_replans: int = MAX_REPLANS,
         max_plan_completion_reminders: int = MAX_PLAN_COMPLETION_REMINDERS,
+        snapshot_factory: Callable[[], WorkspaceSnapshot] | None = None,
         verbose: bool = True,
         output: Callable[[str], None] = print,
         logger: Callable[[str], None] | None = None,
@@ -211,6 +258,9 @@ class CodingAgent:
         self.max_planning_attempts = max_planning_attempts
         self.max_replans = max_replans
         self.max_plan_completion_reminders = max_plan_completion_reminders
+        self.snapshot_factory = snapshot_factory or (
+            lambda: WorkspaceSnapshot(tool_module.WORKSPACE_ROOT)
+        )
         self.verbose = verbose
         self.output = output
         self.logger = logger or (output if verbose else lambda _message: None)
@@ -225,14 +275,34 @@ class CodingAgent:
         messages: list[dict[str, Any]],
         error: str | None = None,
     ) -> AgentResult:
-        return AgentResult(status, final_answer, evidence, plans, steps, messages, error)
+        verification_level: VerificationTier | None = None
+        if any(
+            item.success and item.tier is VerificationTier.ORIGINAL
+            for item in evidence
+        ):
+            verification_level = VerificationTier.ORIGINAL
+        elif any(
+            item.success and item.tier is VerificationTier.SELF
+            for item in evidence
+        ):
+            verification_level = VerificationTier.SELF
+        return AgentResult(
+            status=status,
+            final_answer=final_answer,
+            verification_evidence=evidence,
+            verification_level=verification_level,
+            plan_history=plans,
+            steps=steps,
+            messages=messages,
+            error=error,
+        )
 
     def _fatal(self, reason: str, evidence: list[VerificationEvidence], plans: list[TaskPlan],
                steps: int, messages: list[dict[str, Any]]) -> AgentResult:
         self.logger("[Status] FATAL_ERROR")
         return self._result(
             AgentStatus.FATAL_ERROR,
-            "Agent stopped because the model response or API call failed.",
+            "Agent stopped because of a fatal error.",
             evidence, plans, steps, messages, reason,
         )
 
@@ -308,7 +378,9 @@ class CodingAgent:
                 f"Previous plan and completed statuses:\n{plan_as_json(current_plan)}\n"
                 f"Deviation reason: {reason}\n"
                 "Return a complete plan for the remaining work only. Do not repeat completed "
-                "steps. Preserve the original goal and use only necessary local actions."
+                "steps. Preserve the original goal and use only necessary local actions. "
+                "If a tool or verification command failed, do not blindly repeat the failed "
+                "step before the actions needed to diagnose or repair it."
             ),
         })
         return self._request_plan(
@@ -316,6 +388,120 @@ class CodingAgent:
         )
 
     def run(self, task: str) -> AgentResult:
+        messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        evidence: list[VerificationEvidence] = []
+        plan_history: list[TaskPlan] = []
+        if not isinstance(task, str) or not task.strip():
+            return self._fatal(
+                "Task must be a non-empty string.", evidence, plan_history, 0, messages
+            )
+
+        self.logger("[Workspace snapshot]")
+        try:
+            snapshot = self.snapshot_factory()
+            snapshot.capture()
+        except Exception as exc:
+            return self._fatal(
+                f"Workspace snapshot failed: {exc}",
+                evidence,
+                plan_history,
+                0,
+                messages,
+            )
+        self.logger(
+            "[Original test discovery] "
+            f"available={snapshot.discovery.available} "
+            f"files={len(snapshot.discovery.test_files)}"
+        )
+        try:
+            return self._run_with_snapshot(task, snapshot)
+        finally:
+            snapshot.cleanup()
+
+    def _complete_with_original_tests(
+        self,
+        *,
+        final_answer: str,
+        snapshot: WorkspaceSnapshot,
+        evidence: list[VerificationEvidence],
+        plans: list[TaskPlan],
+        step_number: int,
+        workspace_revision: int,
+        messages: list[dict[str, Any]],
+        external_verification_required: bool,
+    ) -> AgentResult:
+        if not external_verification_required:
+            self.logger("[Status] COMPLETED")
+            return self._result(
+                AgentStatus.COMPLETED,
+                final_answer.strip(),
+                evidence,
+                plans,
+                step_number,
+                messages,
+            )
+
+        discovery = snapshot.discovery
+        if not discovery.has_tests:
+            reason = discovery.error or (
+                "The initial workspace snapshot contained no collectable original tests."
+            )
+            self.logger("[Status] SELF_VERIFIED")
+            return self._result(
+                AgentStatus.SELF_VERIFIED,
+                final_answer.strip(),
+                evidence,
+                plans,
+                step_number,
+                messages,
+                reason,
+            )
+
+        self.logger("[Original test regression]")
+        try:
+            original_result = snapshot.run_original_tests()
+        except Exception as exc:
+            return self._fatal(
+                str(exc), evidence, plans, step_number, messages
+            )
+
+        evidence.append(
+            VerificationEvidence(
+                tier=VerificationTier.ORIGINAL,
+                command=original_result.command,
+                success=original_result.success,
+                output=original_result.output,
+                error=original_result.error,
+                step=step_number,
+                workspace_revision=workspace_revision,
+            )
+        )
+        self.logger(f"[Original tests] success={original_result.success}")
+        if not original_result.success:
+            self.logger("[Status] ORIGINAL_TESTS_FAILED")
+            return self._result(
+                AgentStatus.ORIGINAL_TESTS_FAILED,
+                final_answer.strip(),
+                evidence,
+                plans,
+                step_number,
+                messages,
+                original_result.error or "Original tests failed.",
+            )
+
+        self.logger("[Status] COMPLETED")
+        return self._result(
+            AgentStatus.COMPLETED,
+            final_answer.strip(),
+            evidence,
+            plans,
+            step_number,
+            messages,
+        )
+
+    def _run_with_snapshot(
+        self, task: str, snapshot: WorkspaceSnapshot
+    ) -> AgentResult:
         messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         evidence: list[VerificationEvidence] = []
         plan_history: list[TaskPlan] = []
@@ -437,10 +623,18 @@ class CodingAgent:
                     })
                     continue
 
-                self.logger("[Status] COMPLETED")
-                return self._result(
-                    AgentStatus.COMPLETED, final_answer.strip(), evidence,
-                    plan_history, step_number, messages,
+                return self._complete_with_original_tests(
+                    final_answer=final_answer,
+                    snapshot=snapshot,
+                    evidence=evidence,
+                    plans=plan_history,
+                    step_number=step_number,
+                    workspace_revision=workspace_revision,
+                    messages=messages,
+                    external_verification_required=(
+                        verification_required
+                        or any(item.tier is VerificationTier.SELF for item in evidence)
+                    ),
                 )
 
             parsed_calls: list[tuple[str, str, dict[str, Any] | None, str | None]] = []
@@ -517,8 +711,10 @@ class CodingAgent:
                 continue
 
             batch_blocked = False
+            failed_verification_reason: str | None = None
             for offset, (call_id, name, arguments, _error) in enumerate(parsed_calls):
                 planned_step = remaining[offset]
+                call_was_executed = not batch_blocked
                 if batch_blocked:
                     result = ToolResult(
                         False, error="Not executed because an earlier call in this batch failed."
@@ -540,8 +736,13 @@ class CodingAgent:
                 self.logger(f"[Tool result] success={result.success}")
 
                 command = (arguments or {}).get("command")
-                if name == "execute_command" and is_verification_command(command):
+                if (
+                    call_was_executed
+                    and name == "execute_command"
+                    and is_verification_command(command)
+                ):
                     item = VerificationEvidence(
+                        tier=VerificationTier.SELF,
                         step=step_number,
                         command=" ".join(command),
                         success=result.success,
@@ -556,6 +757,10 @@ class CodingAgent:
                         f"[Verification evidence] {' '.join(command)}: "
                         f"{'passed' if result.success else 'failed'}"
                     )
+                    if not result.success:
+                        failed_verification_reason = _verification_failure_reason(
+                            command, result
+                        )
                 if not result.success:
                     batch_blocked = True
                     continue
@@ -567,6 +772,52 @@ class CodingAgent:
                 if name == "write_file":
                     verification_required = True
                     workspace_revision += 1
+
+            if failed_verification_reason is not None and step_number < self.max_steps:
+                self.logger("[Verification failed] replanning recovery work")
+                if replans >= self.max_replans:
+                    return self._plan_failed(
+                        "The maximum number of replans was exceeded after verification failures.",
+                        evidence,
+                        plan_history,
+                        step_number,
+                        messages,
+                    )
+                replans += 1
+                new_plan, planning_error, fatal_error = self._replan(
+                    task=task,
+                    current_plan=current_plan,
+                    reason=failed_verification_reason,
+                    revision=replans,
+                    verification_required=True,
+                    messages=messages,
+                )
+                if fatal_error:
+                    return self._fatal(
+                        fatal_error, evidence, plan_history, step_number, messages
+                    )
+                if new_plan is None:
+                    return self._plan_failed(
+                        planning_error or "Unable to plan recovery from failed verification.",
+                        evidence,
+                        plan_history,
+                        step_number,
+                        messages,
+                    )
+                current_plan = new_plan
+                plan_history.append(current_plan)
+                current_step_index = 0
+                plan_completion_reminders = 0
+                self._log_plan(current_plan, replan=True)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Verification failed, so the revised recovery plan is accepted and "
+                        "mandatory. Execute its pending repair and verification steps in order:\n"
+                        f"{plan_as_json(current_plan)}"
+                    ),
+                })
+                continue
 
         self.logger("[Status] MAX_STEPS_REACHED")
         return self._result(
