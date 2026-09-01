@@ -1,4 +1,4 @@
-"""Command-line entry point for the v0.4 plan-constrained coding agent."""
+"""Command-line entry point for the v0.6 coding agent."""
 
 import argparse
 import json
@@ -23,6 +23,32 @@ def print_result(result: AgentResult) -> None:
 
     if result.verification_level is not None:
         print(f"\n[Verification level] {result.verification_level.value}")
+
+    if result.working_memory is not None:
+        memory = result.working_memory
+        print("\n[Working Memory]")
+        print(f"Goal: {memory.goal}")
+        print(f"Plan revision: {memory.plan_revision}")
+        print(f"Workspace revision: {memory.workspace_revision}")
+        print(f"Verification: {memory.verification_state.value}")
+        if memory.constraints:
+            print("Explicit constraints:")
+            for constraint in memory.constraints:
+                print(f"- {constraint}")
+        if memory.read_files:
+            print("Files read:")
+            for record in memory.read_files.values():
+                print(
+                    f"- {record.path} (revision {record.workspace_revision}, "
+                    f"reads {record.reads})"
+                )
+        if memory.modified_files:
+            print("Files modified:")
+            for record in memory.modified_files.values():
+                print(
+                    f"- {record.path} (revision {record.workspace_revision}, "
+                    f"writes {record.writes})"
+                )
 
     print("\n[Plan History]")
     if not result.plan_history:

@@ -175,6 +175,112 @@ def test_planning_precedes_tools_and_receives_root_inventory() -> None:
     assert llm.calls[1]["tools"] is not None
 
 
+def test_working_memory_is_injected_into_every_llm_call() -> None:
+    llm = FakeLLM([plan_response([]), final_response("Done.")])
+
+    result = run_agent(llm)("Explain this project. You must only inspect it.")
+
+    assert result.status is AgentStatus.COMPLETED
+    assert result.working_memory is not None
+    assert result.working_memory.constraints == [
+        "Explain this project. You must only inspect it."
+    ]
+    for call in llm.calls:
+        memory_messages = [
+            message for message in call["messages"]
+            if str(message.get("content", "")).startswith("WORKING MEMORY (")
+        ]
+        assert len(memory_messages) == 1
+
+
+def test_duplicate_read_in_same_revision_is_rejected_and_replanned() -> None:
+    repeated_reads = [
+        planned_step("read_once", "read_file", {"path": "a.py"}),
+        planned_step("read_again", "read_file", {"path": "a.py"}),
+    ]
+    llm = FakeLLM([
+        plan_response(repeated_reads),
+        tool_response(tool_call("first", "read_file", {"path": "a.py"})),
+        tool_response(tool_call("duplicate", "read_file", {"path": "a.py"})),
+        plan_response([]),
+        final_response("Inspected without rereading."),
+    ])
+    executor = FakeExecutor(results=[ToolResult(True, "source")])
+
+    result = run_agent(llm, executor)("Inspect a.py.")
+
+    assert result.status is AgentStatus.COMPLETED
+    assert executor.calls[1:] == [("read_file", {"path": "a.py"})]
+    assert len(result.plan_history) == 2
+    assert result.working_memory is not None
+    assert result.working_memory.read_files["a.py"].reads == 1
+    duplicate_observation = next(
+        message for message in llm.calls[3]["messages"]
+        if message.get("tool_call_id") == "duplicate"
+    )
+    assert "Duplicate read_file refused" in duplicate_observation["content"]
+
+
+def test_duplicate_paths_in_one_batch_are_normalized_and_batch_is_atomic() -> None:
+    steps = [
+        planned_step("read_one", "read_file", {"path": "a.py"}),
+        planned_step("read_alias", "read_file", {"path": "./a.py"}),
+    ]
+    llm = FakeLLM([
+        plan_response(steps),
+        tool_response(
+            tool_call("one", "read_file", {"path": "a.py"}),
+            tool_call("alias", "read_file", {"path": "./a.py"}),
+        ),
+        plan_response([]),
+        final_response("Done."),
+    ])
+    executor = FakeExecutor()
+
+    result = run_agent(llm, executor)("Inspect a.py once.")
+
+    assert result.status is AgentStatus.COMPLETED
+    assert executor.calls == [("list_files", {"path": "."})]
+
+
+def test_write_revision_allows_a_needed_reread() -> None:
+    steps = [
+        planned_step("read", "read_file", {"path": "a.py"}),
+        planned_step("write", "write_file", {"path": "a.py"}),
+        planned_step("reread", "read_file", {"path": "a.py"}),
+        planned_step(
+            "verify", "execute_command", {"command": ["python", "a.py"]}
+        ),
+    ]
+    llm = FakeLLM([
+        plan_response(steps),
+        tool_response(tool_call("read", "read_file", {"path": "a.py"})),
+        tool_response(
+            tool_call("write", "write_file", {"path": "a.py", "content": "ok"})
+        ),
+        tool_response(tool_call("reread", "read_file", {"path": "a.py"})),
+        tool_response(
+            tool_call("verify", "execute_command", {"command": ["python", "a.py"]})
+        ),
+        final_response("Done."),
+    ])
+    executor = FakeExecutor(results=[
+        ToolResult(True, "old"),
+        ToolResult(True, "written"),
+        ToolResult(True, "new"),
+        ToolResult(True, "passed"),
+    ])
+
+    result = run_agent(llm, executor)("Modify a.py and verify it.")
+
+    assert result.status is AgentStatus.COMPLETED
+    assert result.working_memory is not None
+    assert result.working_memory.workspace_revision == 1
+    assert result.working_memory.read_files["a.py"].reads == 2
+    assert result.working_memory.read_files["a.py"].workspace_revision == 1
+    assert result.working_memory.modified_files["a.py"].writes == 1
+
+
 def test_inventory_failure_returns_plan_failed_without_llm_call() -> None:
     llm = FakeLLM([])
     executor = FakeExecutor(inventory=ToolResult(False, error="cannot list root"))

@@ -1,4 +1,4 @@
-"""Plan-constrained coding-agent loop for v0.4."""
+"""Plan-constrained coding-agent loop with v0.6 working memory."""
 
 from __future__ import annotations
 
@@ -25,6 +25,11 @@ from planning import (
 from tool_schemas import TOOLS
 from tools import ToolResult, execute_tool
 from workspace_snapshot import WorkspaceSnapshot
+from working_memory import (
+    WorkingMemory,
+    messages_with_working_memory,
+    normalize_workspace_path,
+)
 
 MAX_STEPS = 20
 MAX_VERIFICATION_REQUESTS = 3
@@ -41,6 +46,8 @@ Use only the supplied tools for local actions. Never claim that a file was chang
 command passed without a successful tool result. For tasks that create or modify files,
 finish with a real verification command such as `python -m pytest` or an allowed Python
 script. Return a concise final answer only after the accepted plan is complete.
+Treat the injected WORKING MEMORY as authoritative run state. Reuse prior successful
+file observations instead of reading the same file again at the same workspace revision.
 """
 
 
@@ -88,6 +95,7 @@ class AgentResult:
     steps: int
     messages: list[dict[str, Any]]
     error: str | None = None
+    working_memory: WorkingMemory | None = None
 
 
 def task_requires_verification(task: str) -> bool:
@@ -264,6 +272,7 @@ class CodingAgent:
         self.verbose = verbose
         self.output = output
         self.logger = logger or (output if verbose else lambda _message: None)
+        self._active_memory: WorkingMemory | None = None
 
     def _result(
         self,
@@ -295,6 +304,7 @@ class CodingAgent:
             steps=steps,
             messages=messages,
             error=error,
+            working_memory=self._active_memory,
         )
 
     def _fatal(self, reason: str, evidence: list[VerificationEvidence], plans: list[TaskPlan],
@@ -325,6 +335,13 @@ class CodingAgent:
             constraints = json.dumps(step.argument_constraints, ensure_ascii=False)
             self.logger(f"{index}. {step.tool} {constraints}")
 
+    def _messages_for_llm(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if self._active_memory is None:
+            return list(messages)
+        return messages_with_working_memory(messages, self._active_memory)
+
     def _request_plan(
         self,
         messages: list[dict[str, Any]],
@@ -335,7 +352,9 @@ class CodingAgent:
         last_error = "The model did not return a valid plan."
         for attempt in range(1, self.max_planning_attempts + 1):
             try:
-                raw_plan = self.llm_client.chat(messages=messages)
+                raw_plan = self.llm_client.chat(
+                    messages=self._messages_for_llm(messages)
+                )
             except Exception as exc:
                 return None, None, f"Planning API request failed: {exc}"
             messages.append({"role": "assistant", "content": raw_plan})
@@ -388,6 +407,7 @@ class CodingAgent:
         )
 
     def run(self, task: str) -> AgentResult:
+        self._active_memory = None
         messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         evidence: list[VerificationEvidence] = []
         plan_history: list[TaskPlan] = []
@@ -395,6 +415,11 @@ class CodingAgent:
             return self._fatal(
                 "Task must be a non-empty string.", evidence, plan_history, 0, messages
             )
+
+        self._active_memory = WorkingMemory.from_task(
+            task,
+            verification_required=task_requires_verification(task),
+        )
 
         self.logger("[Workspace snapshot]")
         try:
@@ -476,6 +501,10 @@ class CodingAgent:
                 workspace_revision=workspace_revision,
             )
         )
+        if self._active_memory is not None:
+            self._active_memory.record_original_verification(
+                original_result.command, success=original_result.success
+            )
         self.logger(f"[Original tests] success={original_result.success}")
         if not original_result.success:
             self.logger("[Status] ORIGINAL_TESTS_FAILED")
@@ -510,6 +539,10 @@ class CodingAgent:
                 "Task must be a non-empty string.", evidence, plan_history, 0, messages
             )
         verification_required = task_requires_verification(task)
+        memory = self._active_memory or WorkingMemory.from_task(
+            task, verification_required=verification_required
+        )
+        self._active_memory = memory
         workspace_revision = 0
         last_verified_revision: int | None = None
         verification_requests = 0
@@ -553,6 +586,7 @@ class CodingAgent:
                 evidence, plan_history, 0, messages,
             )
         plan_history.append(current_plan)
+        memory.accept_plan(current_plan)
         self._log_plan(current_plan)
         messages.append({
             "role": "system",
@@ -566,7 +600,9 @@ class CodingAgent:
         for step_number in range(1, self.max_steps + 1):
             self.logger(f"[Step {step_number}]")
             try:
-                raw_message = self.llm_client.chat(messages=messages, tools=TOOLS)
+                raw_message = self.llm_client.chat(
+                    messages=self._messages_for_llm(messages), tools=TOOLS
+                )
                 assistant_message = _assistant_message_to_dict(raw_message)
             except Exception as exc:
                 return self._fatal(
@@ -656,6 +692,7 @@ class CodingAgent:
 
             remaining = current_plan.steps[current_step_index:]
             deviations: list[str] = []
+            batch_read_paths: set[str] = set()
             if len(parsed_calls) > len(remaining):
                 deviations.append("The batch contains more calls than remaining plan steps.")
             else:
@@ -665,9 +702,22 @@ class CodingAgent:
                     )
                     if not matched and match_error:
                         deviations.append(match_error)
+                    if matched and name == "read_file":
+                        path = str((arguments or {}).get("path", ""))
+                        normalized_path = normalize_workspace_path(path)
+                        if (
+                            memory.was_read_in_current_revision(path)
+                            or normalized_path in batch_read_paths
+                        ):
+                            deviations.append(
+                                f"Duplicate read_file refused for '{path}' at workspace "
+                                f"revision {workspace_revision}; reuse the existing observation."
+                            )
+                        batch_read_paths.add(normalized_path)
 
             if deviations:
                 reason = " ".join(deviations)
+                memory.add_issue(reason)
                 self.logger(f"[Plan deviation] {reason}")
                 for call_id, name, _arguments, _error in parsed_calls:
                     messages.append({
@@ -698,6 +748,7 @@ class CodingAgent:
                     )
                 current_plan = new_plan
                 plan_history.append(current_plan)
+                memory.accept_plan(current_plan)
                 current_step_index = 0
                 plan_completion_reminders = 0
                 self._log_plan(current_plan, replan=True)
@@ -751,6 +802,9 @@ class CodingAgent:
                         workspace_revision=workspace_revision,
                     )
                     evidence.append(item)
+                    memory.record_self_verification(
+                        " ".join(command), success=result.success
+                    )
                     if result.success:
                         last_verified_revision = workspace_revision
                     self.logger(
@@ -769,11 +823,22 @@ class CodingAgent:
                 current_step_index += 1
                 plan_completion_reminders = 0
                 command = (arguments or {}).get("command")
+                if name == "read_file":
+                    memory.record_read(
+                        str((arguments or {}).get("path", "")),
+                        purpose=planned_step.description,
+                    )
                 if name == "write_file":
                     verification_required = True
                     workspace_revision += 1
+                    memory.record_write(
+                        str((arguments or {}).get("path", "")),
+                        workspace_revision=workspace_revision,
+                    )
+                memory.complete_step(planned_step, current_plan)
 
             if failed_verification_reason is not None and step_number < self.max_steps:
+                memory.add_issue(failed_verification_reason)
                 self.logger("[Verification failed] replanning recovery work")
                 if replans >= self.max_replans:
                     return self._plan_failed(
@@ -806,6 +871,7 @@ class CodingAgent:
                     )
                 current_plan = new_plan
                 plan_history.append(current_plan)
+                memory.accept_plan(current_plan)
                 current_step_index = 0
                 plan_completion_reminders = 0
                 self._log_plan(current_plan, replan=True)

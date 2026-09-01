@@ -12,6 +12,7 @@ from agent import (
     VerificationEvidence,
     VerificationTier,
 )
+from working_memory import WorkingMemory
 
 
 def result_for(status: AgentStatus) -> AgentResult:
@@ -74,3 +75,20 @@ def test_cli_prints_original_test_output(capsys: pytest.CaptureFixture[str]) -> 
     assert "[Verification level] SELF" in output
     assert "[ORIGINAL]" in output
     assert "original assertion failed" in output
+
+
+def test_cli_prints_compact_working_memory(capsys: pytest.CaptureFixture[str]) -> None:
+    result = result_for(AgentStatus.COMPLETED)
+    memory = WorkingMemory.from_task(
+        "Inspect a.py. Do not modify it.", verification_required=False
+    )
+    memory.record_read("a.py", purpose="Inspect the target")
+    result.working_memory = memory
+
+    cli.print_result(result)
+    output = capsys.readouterr().out
+
+    assert "[Working Memory]" in output
+    assert "Files read:" in output
+    assert "a.py (revision 0, reads 1)" in output
+    assert "Do not modify it" in output
