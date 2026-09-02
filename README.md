@@ -1,6 +1,6 @@
 # Mini Coding Agent
 
-一个从零实现的轻量级 Coding Agent，不依赖 LangChain、AutoGen 等 Agent 框架。项目通过阿里云百炼 OpenAI-compatible API 调用 Qwen Builder 和 DeepSeek Verifier。
+一个从零实现的轻量级 Coding Agent 。项目通过阿里云百炼 OpenAI-compatible API 调用 Qwen Builder 和 DeepSeek Verifier。
 
 ## Git 仓库
 
@@ -29,12 +29,6 @@ VERIFIER_MODEL=deepseek-v4-flash
 python main.py "检查项目，修复问题并说明修改内容"
 ```
 
-运行项目自身测试：
-
-```bash
-python -m pytest -q
-```
-
 ## 工作流
 
 ```text
@@ -54,8 +48,15 @@ Workspace 快照与原测试发现
 - **异构双模型**：Qwen 负责规划和代码修改；DeepSeek 在隔离上下文中审查最终源码、寻找反例和未确认假设，降低同一模型“自己出题、自己判卷”的自洽偏差。
 - **Verifier 建议机制**：Verifier 返回严格 JSON，但 `PASS/FAIL` 仅作为建议展示，不直接决定任务成败；API 或响应协议异常仍会返回 `VERIFIER_FAILED`。
 - **快照原测试回归**：任务开始时复制 workspace 并记录原测试。Agent 结束后，在临时副本中恢复原测试和 pytest 配置，再针对最终代码执行，避免通过修改或删除测试获得成功状态。
-- **可观测执行过程**：CLI 展示 workspace 快照、原测试发现、Planning、Tool Call、Working Memory、Verifier 建议、Plan History、`ORIGINAL` 验证证据及最终状态。
 
 ## 当前限制
 
-- 本项目未使用容器或独立系统账户，仅建议处理可信代码。
+- **正确性仍是核心挑战**：测试通过只能提供有限证据，无法证明代码在所有输入和真实场景下都满足需求。
+- **工程能力仍有限**：目前主要面向 Python 项目和有限命令集合，尚未支持插件化工具、更多语言/构建系统、IDE/LSP、Git 工作流等。后续可以通过统一 Tool 接口扩展不同语言工具链，而不改变 Agent 主循环。
+- **Working Memory 是轻量状态而非长期记忆**：当前只服务于单次任务，不做跨任务学习、向量检索或持久化记忆。
+
+## 开发思考
+
+这个项目不是一次性设计出来的，而是从最小 LLM 调用开始逐步演化：Local Tool Layer → Tool Calling → Verification → Planning → 原测试回归 → Working Memory → 独立 Verifier。每一层基本都来自前一版本真实运行中暴露的问题。
+
+开发过程中一个很明显的体会是：Coding Agent 很容易不断“做加法”。出现失败时，可以继续增加 Planner、Memory、Verifier、状态和规则，但模块越多，状态之间的耦合也越复杂；在 Vibe Coding 中，这一点尤其明显——代码增长很快，但一旦行为异常，很难判断问题来自 Prompt、模型决策、计划状态、工具执行还是验证逻辑。
