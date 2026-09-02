@@ -13,6 +13,7 @@ from agent import (
     VerificationTier,
 )
 from working_memory import WorkingMemory
+from verifier import VerifierReview, VerifierVerdict
 
 
 def result_for(status: AgentStatus) -> AgentResult:
@@ -33,9 +34,9 @@ def result_for(status: AgentStatus) -> AgentResult:
     [
         (AgentStatus.COMPLETED, 0),
         (AgentStatus.FATAL_ERROR, 1),
-        (AgentStatus.SELF_VERIFIED, 2),
         (AgentStatus.ORIGINAL_TESTS_FAILED, 2),
         (AgentStatus.PLAN_FAILED, 2),
+        (AgentStatus.VERIFIER_FAILED, 2),
     ],
 )
 def test_cli_exit_codes(
@@ -44,11 +45,17 @@ def test_cli_exit_codes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(sys, "argv", ["main.py", "task"])
-    monkeypatch.setattr(cli, "LLMClient", lambda: object())
+    settings = SimpleNamespace(
+        builder_model="qwen-plus", verifier_model="deepseek-v4-flash"
+    )
+    monkeypatch.setattr(cli.Settings, "from_env", lambda: settings)
+    monkeypatch.setattr(cli, "LLMClient", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(
         cli,
         "CodingAgent",
-        lambda _client: SimpleNamespace(run=lambda _task: result_for(status)),
+        lambda _client, **_kwargs: SimpleNamespace(
+            run=lambda _task: result_for(status)
+        ),
     )
 
     assert cli.main() == expected_exit
@@ -56,7 +63,6 @@ def test_cli_exit_codes(
 
 def test_cli_prints_original_test_output(capsys: pytest.CaptureFixture[str]) -> None:
     result = result_for(AgentStatus.ORIGINAL_TESTS_FAILED)
-    result.verification_level = VerificationTier.SELF
     result.verification_evidence = [
         VerificationEvidence(
             tier=VerificationTier.ORIGINAL,
@@ -72,7 +78,7 @@ def test_cli_prints_original_test_output(capsys: pytest.CaptureFixture[str]) -> 
     cli.print_result(result)
     output = capsys.readouterr().out
 
-    assert "[Verification level] SELF" in output
+    assert "[Verification level]" not in output
     assert "[ORIGINAL]" in output
     assert "original assertion failed" in output
 
@@ -92,3 +98,24 @@ def test_cli_prints_compact_working_memory(capsys: pytest.CaptureFixture[str]) -
     assert "Files read:" in output
     assert "a.py (revision 0, reads 1)" in output
     assert "Do not modify it" in output
+
+
+def test_cli_prints_independent_verifier_review(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = result_for(AgentStatus.COMPLETED)
+    result.verifier_review = VerifierReview(
+        verdict=VerifierVerdict.FAIL,
+        summary="A boundary case fails.",
+        requirement_checks=[],
+        counterexamples=["Empty input"],
+        unresolved_assumptions=["Input is never empty"],
+    )
+
+    cli.print_result(result)
+    output = capsys.readouterr().out
+
+    assert "[Independent Verifier Advice]" in output
+    assert "Verdict: FAIL" in output
+    assert "Empty input" in output
+    assert "Input is never empty" in output

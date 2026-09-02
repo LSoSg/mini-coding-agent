@@ -61,7 +61,8 @@ Rules:
 - For write_file, constrain path only; never include the full content in the plan.
 - Commands must match exactly one supported command: ["pytest"], ["python", "-m", "pytest"], ["python", "<workspace script.py>"], ["git", "status"], or ["git", "diff"].
 - For pytest, the command MUST be exactly ["pytest"] or ["python", "-m", "pytest"]. Never append a test filename, -q, -v, or any other argument.
-- Code creation or modification plans must include a verification command after the last write.
+- Builder-authored tests and verification commands are optional. The outer pipeline performs
+  an independent model review and restores snapshot tests for regression when they exist.
 - Do not wrap the JSON in Markdown fences and do not include commentary outside JSON."""
 
 
@@ -247,15 +248,17 @@ def parse_plan(
     write_indexes = [
         index for index, step in enumerate(steps) if step.tool == "write_file"
     ]
-    if verification_required or write_indexes:
-        if not verification_indexes:
-            raise PlanValidationError(
-                "This task requires a planned verification command."
-            )
-        if write_indexes and max(verification_indexes) < max(write_indexes):
-            raise PlanValidationError(
-                "Verification must be planned after the final write_file step."
-            )
+    # ``verification_required`` is retained for API compatibility. Runtime writes, rather
+    # than task keywords, now create the actual verification obligation.
+    _ = verification_required
+    if (
+        verification_indexes
+        and write_indexes
+        and max(verification_indexes) < max(write_indexes)
+    ):
+        raise PlanValidationError(
+            "Verification must be planned after the final write_file step."
+        )
 
     return TaskPlan(
         goal=data["goal"].strip(),

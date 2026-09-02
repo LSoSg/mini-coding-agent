@@ -15,8 +15,11 @@ class LLMError(RuntimeError):
 class LLMClient:
     """Small wrapper around the OpenAI-compatible Chat Completions API."""
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self, settings: Settings | None = None, *, model: str | None = None
+    ) -> None:
         self.settings = settings or Settings.from_env()
+        self.model = model or self.settings.model
         try:
             self._client = OpenAI(
                 api_key=self.settings.api_key,
@@ -49,7 +52,7 @@ class LLMClient:
     ) -> str | Any:
         """Send messages and return text or an assistant tool-calling message."""
         request: dict[str, Any] = {
-            "model": self.settings.model,
+            "model": getattr(self, "model", self.settings.model),
             "messages": list(messages),
         }
         if tools is not None:

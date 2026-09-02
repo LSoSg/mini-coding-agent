@@ -18,9 +18,6 @@ MAX_TEXT_CHARS = 300
 
 class MemoryVerificationState(str, Enum):
     NOT_REQUIRED = "NOT_REQUIRED"
-    REQUIRED = "REQUIRED"
-    SELF_FAILED = "SELF_FAILED"
-    SELF_PASSED = "SELF_PASSED"
     ORIGINAL_FAILED = "ORIGINAL_FAILED"
     ORIGINAL_PASSED = "ORIGINAL_PASSED"
 
@@ -91,14 +88,14 @@ class WorkingMemory:
 
     @classmethod
     def from_task(cls, task: str, *, verification_required: bool) -> WorkingMemory:
+        # Kept in the signature for callers from earlier versions. A task keyword no
+        # longer creates debt; only a successful write does.
+        _ = verification_required
         return cls(
             original_task=_shorten(task, 2_000),
             goal=_shorten(task, 1_000),
             constraints=extract_explicit_constraints(task),
-            verification_state=(
-                MemoryVerificationState.REQUIRED
-                if verification_required else MemoryVerificationState.NOT_REQUIRED
-            ),
+            verification_state=MemoryVerificationState.NOT_REQUIRED,
         )
 
     def accept_plan(self, plan: TaskPlan) -> None:
@@ -149,14 +146,6 @@ class WorkingMemory:
                 workspace_revision=workspace_revision,
                 writes=writes,
             )
-        self.verification_state = MemoryVerificationState.REQUIRED
-
-    def record_self_verification(self, command: str, *, success: bool) -> None:
-        self.last_verification_command = command
-        self.verification_state = (
-            MemoryVerificationState.SELF_PASSED
-            if success else MemoryVerificationState.SELF_FAILED
-        )
 
     def record_original_verification(self, command: str, *, success: bool) -> None:
         self.last_verification_command = command

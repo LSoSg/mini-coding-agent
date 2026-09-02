@@ -48,3 +48,13 @@ def test_chat_with_tools_returns_assistant_message() -> None:
 
     assert result is message
     assert completions.requests[0]["tools"] == schemas
+
+
+def test_explicit_model_selects_independent_pipeline_model() -> None:
+    message = SimpleNamespace(content="review")
+    client, completions = make_client(message)
+    client.model = "deepseek-v4-flash"
+
+    client.chat([{"role": "user", "content": "review code"}])
+
+    assert completions.requests[0]["model"] == "deepseek-v4-flash"

@@ -72,7 +72,7 @@ def test_invalid_plans_are_rejected(raw: str) -> None:
         parse_plan(raw, revision=0, verification_required=False)
 
 
-def test_change_plan_requires_verification_after_last_write() -> None:
+def test_initial_write_plan_may_defer_verification_but_cannot_order_it_early() -> None:
     missing = encoded_plan([
         step("write", "write_file", {"path": "a.py"}),
     ])
@@ -80,9 +80,11 @@ def test_change_plan_requires_verification_after_last_write() -> None:
         step("test", "execute_command", {"command": ["python", "-m", "pytest"]}),
         step("write", "write_file", {"path": "a.py"}),
     ])
-    for raw in (missing, wrong_order):
-        with pytest.raises(PlanValidationError):
-            parse_plan(raw, revision=0, verification_required=True)
+    plan = parse_plan(missing, revision=0, verification_required=True)
+    assert [item.tool for item in plan.steps] == ["write_file"]
+
+    with pytest.raises(PlanValidationError, match="after the final write_file"):
+        parse_plan(wrong_order, revision=0, verification_required=True)
 
 
 def test_only_allowlisted_commands_may_be_planned() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import PurePosixPath
 from typing import Any, Callable, Protocol, Sequence
 
 import tools as tool_module
@@ -17,7 +18,6 @@ from planning import (
     PlanStepStatus,
     PlanValidationError,
     TaskPlan,
-    is_verification_command,
     match_plan_step,
     parse_plan,
     plan_as_json,
@@ -25,15 +25,18 @@ from planning import (
 from tool_schemas import TOOLS
 from tools import ToolResult, execute_tool
 from workspace_snapshot import WorkspaceSnapshot
-from working_memory import (
-    WorkingMemory,
-    messages_with_working_memory,
-    normalize_workspace_path,
+from working_memory import WorkingMemory, messages_with_working_memory, normalize_workspace_path
+from verifier import (
+    MAX_VERIFIER_ATTEMPTS,
+    VerifierProtocolError,
+    VerifierReview,
+    parse_verifier_review,
+    verifier_messages,
 )
 
 MAX_STEPS = 20
-MAX_VERIFICATION_REQUESTS = 3
 MAX_TOOL_LOG_ARGUMENT_CHARS = 240
+MAX_VERIFIER_SOURCE_CHARS = 30_000
 
 SYSTEM_PROMPT = """You are a coding agent operating inside a controlled workspace.
 An accepted structured plan is a hard execution contract. Follow its pending steps in
@@ -43,9 +46,10 @@ call must be an atomic action tied to the user's goal. If the plan no longer fit
 improvise: a plan deviation will trigger a bounded replanning phase.
 
 Use only the supplied tools for local actions. Never claim that a file was changed or a
-command passed without a successful tool result. For tasks that create or modify files,
-finish with a real verification command such as `python -m pytest` or an allowed Python
-script. Return a concise final answer only after the accepted plan is complete.
+command passed without a successful tool result. Builder-authored tests and commands are
+optional implementation aids, not a completion requirement. Return a concise final answer
+after the accepted plan is complete; independent review and snapshot regression happen
+outside the Builder loop.
 Treat the injected WORKING MEMORY as authoritative run state. Reuse prior successful
 file observations instead of reading the same file again at the same workspace revision.
 """
@@ -61,16 +65,14 @@ class LLMChatClient(Protocol):
 
 class AgentStatus(str, Enum):
     COMPLETED = "COMPLETED"
-    SELF_VERIFIED = "SELF_VERIFIED"
     ORIGINAL_TESTS_FAILED = "ORIGINAL_TESTS_FAILED"
-    VERIFICATION_REQUIRED = "VERIFICATION_REQUIRED"
     MAX_STEPS_REACHED = "MAX_STEPS_REACHED"
     FATAL_ERROR = "FATAL_ERROR"
     PLAN_FAILED = "PLAN_FAILED"
+    VERIFIER_FAILED = "VERIFIER_FAILED"
 
 
 class VerificationTier(str, Enum):
-    SELF = "SELF"
     ORIGINAL = "ORIGINAL"
 
 
@@ -96,6 +98,7 @@ class AgentResult:
     messages: list[dict[str, Any]]
     error: str | None = None
     working_memory: WorkingMemory | None = None
+    verifier_review: VerifierReview | None = None
 
 
 def task_requires_verification(task: str) -> bool:
@@ -184,40 +187,6 @@ def _tool_result_payload(result: ToolResult) -> str:
     )
 
 
-def _verification_failure_reason(command: list[str], result: ToolResult) -> str:
-    """Build actionable replanning context from a failed verification result."""
-
-    command_text = " ".join(command)
-    diagnostics = f"{result.error or ''}\n{result.output or ''}".casefold()
-    is_pytest = command in (["pytest"], ["python", "-m", "pytest"])
-    no_tests_collected = any(
-        marker in diagnostics
-        for marker in (
-            "exit status 5",
-            "non-zero status 5",
-            "exit_code: 5",
-            "collected 0 items",
-            "no tests collected",
-            "no tests ran",
-        )
-    )
-    if is_pytest and no_tests_collected:
-        return (
-            f"The planned verification command {command_text} failed because pytest "
-            "collected no tests (exit code 5). Before running pytest again, create a "
-            "separate discoverable test module whose filename matches `test_*.py` "
-            "(for example, `test_floyd.py`). Merely adding `test_*` functions to a "
-            "normal source module such as `floyd.py` will not make pytest collect it."
-        )
-
-    return (
-        f"The planned verification command {command_text} failed: "
-        f"{result.error or 'see the tool result for diagnostics'}. Replace that failed "
-        "pending step with a plan that performs any necessary diagnosis or file repairs "
-        "before running verification again."
-    )
-
-
 def _safe_tool_call_summary(name: str, arguments: dict[str, Any]) -> str:
     safe_arguments = dict(arguments)
     if name == "write_file" and "content" in safe_arguments:
@@ -238,9 +207,9 @@ class CodingAgent:
         self,
         llm_client: LLMChatClient,
         *,
+        verifier_client: LLMChatClient | None = None,
         tool_executor: Callable[[str, dict[str, Any]], ToolResult] = execute_tool,
         max_steps: int = MAX_STEPS,
-        max_verification_requests: int = MAX_VERIFICATION_REQUESTS,
         max_planning_attempts: int = MAX_PLANNING_ATTEMPTS,
         max_replans: int = MAX_REPLANS,
         max_plan_completion_reminders: int = MAX_PLAN_COMPLETION_REMINDERS,
@@ -251,8 +220,6 @@ class CodingAgent:
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1.")
-        if max_verification_requests < 0:
-            raise ValueError("max_verification_requests cannot be negative.")
         if max_planning_attempts < 1:
             raise ValueError("max_planning_attempts must be at least 1.")
         if max_replans < 0:
@@ -260,9 +227,9 @@ class CodingAgent:
         if max_plan_completion_reminders < 0:
             raise ValueError("max_plan_completion_reminders cannot be negative.")
         self.llm_client = llm_client
+        self.verifier_client = verifier_client
         self.tool_executor = tool_executor
         self.max_steps = max_steps
-        self.max_verification_requests = max_verification_requests
         self.max_planning_attempts = max_planning_attempts
         self.max_replans = max_replans
         self.max_plan_completion_reminders = max_plan_completion_reminders
@@ -273,6 +240,7 @@ class CodingAgent:
         self.output = output
         self.logger = logger or (output if verbose else lambda _message: None)
         self._active_memory: WorkingMemory | None = None
+        self._active_verifier_review: VerifierReview | None = None
 
     def _result(
         self,
@@ -290,11 +258,6 @@ class CodingAgent:
             for item in evidence
         ):
             verification_level = VerificationTier.ORIGINAL
-        elif any(
-            item.success and item.tier is VerificationTier.SELF
-            for item in evidence
-        ):
-            verification_level = VerificationTier.SELF
         return AgentResult(
             status=status,
             final_answer=final_answer,
@@ -305,6 +268,7 @@ class CodingAgent:
             messages=messages,
             error=error,
             working_memory=self._active_memory,
+            verifier_review=self._active_verifier_review,
         )
 
     def _fatal(self, reason: str, evidence: list[VerificationEvidence], plans: list[TaskPlan],
@@ -372,7 +336,7 @@ class CodingAgent:
                         "role": "system",
                         "content": (
                             f"The proposed plan is invalid: {last_error} "
-                            "Return a corrected strict JSON plan only."
+                            + "Return corrected strict JSON only."
                         ),
                     })
                 continue
@@ -403,11 +367,123 @@ class CodingAgent:
             ),
         })
         return self._request_plan(
-            messages, revision=revision, verification_required=verification_required
+            messages,
+            revision=revision,
+            verification_required=verification_required,
         )
+
+    @staticmethod
+    def _next_plan_revision(plans: list[TaskPlan]) -> int:
+        return max((plan.revision for plan in plans), default=-1) + 1
+
+    @staticmethod
+    def _is_builder_test_asset(path: str) -> bool:
+        normalized = PurePosixPath(path.replace("\\", "/"))
+        parts = {part.casefold() for part in normalized.parts}
+        name = normalized.name.casefold()
+        return (
+            bool(parts & {"test", "tests"})
+            or name.startswith("test_")
+            or name.endswith("_test.py")
+            or name in {
+                "conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg"
+            }
+        )
+
+    def _build_verifier_context(
+        self,
+        *,
+        task: str,
+        plans: list[TaskPlan],
+        evidence: list[VerificationEvidence],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        memory = self._active_memory
+        if memory is None:
+            return None, "Working memory is unavailable for independent verification."
+
+        source_files: dict[str, str] = {}
+        total_chars = 0
+        for path in memory.modified_files:
+            if self._is_builder_test_asset(path):
+                continue
+            try:
+                result = self.tool_executor("read_file", {"path": path})
+            except Exception as exc:
+                return None, f"Unable to collect verifier source '{path}': {exc}"
+            if not isinstance(result, ToolResult) or not result.success:
+                reason = result.error if isinstance(result, ToolResult) else "invalid result"
+                return None, f"Unable to collect verifier source '{path}': {reason}"
+            remaining = MAX_VERIFIER_SOURCE_CHARS - total_chars
+            if remaining <= 0:
+                break
+            content = result.output[:remaining]
+            source_files[path] = content
+            total_chars += len(content)
+
+        criteria: list[str] = []
+        for plan in plans:
+            for criterion in plan.success_criteria:
+                if criterion not in criteria:
+                    criteria.append(criterion)
+        return {
+            "original_requirement": task,
+            "accepted_success_criteria": criteria,
+            "explicit_user_constraints": memory.constraints,
+            "workspace_revision": memory.workspace_revision,
+            "modified_non_test_files": source_files,
+            "isolation_note": (
+                "Builder messages, reasoning, generated tests, and test configurations "
+                "are intentionally excluded."
+            ),
+        }, None
+
+    def _request_verifier_review(
+        self,
+        *,
+        task: str,
+        plans: list[TaskPlan],
+        evidence: list[VerificationEvidence],
+    ) -> tuple[VerifierReview | None, str | None, str | None]:
+        if self.verifier_client is None:
+            return None, None, None
+        context, context_error = self._build_verifier_context(
+            task=task, plans=plans, evidence=evidence
+        )
+        if context is None:
+            return None, context_error, None
+
+        review_messages = verifier_messages(context)
+        last_error = "Verifier did not return a valid review."
+        for attempt in range(1, MAX_VERIFIER_ATTEMPTS + 1):
+            try:
+                raw_review = self.verifier_client.chat(messages=review_messages)
+            except Exception as exc:
+                return None, None, f"Verifier API request failed: {exc}"
+            try:
+                review = parse_verifier_review(raw_review)
+            except VerifierProtocolError as exc:
+                last_error = str(exc)
+                self.logger(
+                    f"[Verifier attempt {attempt}] invalid review: {last_error}"
+                )
+                if attempt < MAX_VERIFIER_ATTEMPTS:
+                    review_messages.extend([
+                        {"role": "assistant", "content": raw_review},
+                        {
+                            "role": "system",
+                            "content": (
+                                f"The review is invalid: {last_error} "
+                                "Return corrected strict JSON only."
+                            ),
+                        },
+                    ])
+                continue
+            return review, None, None
+        return None, last_error, None
 
     def run(self, task: str) -> AgentResult:
         self._active_memory = None
+        self._active_verifier_review = None
         messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         evidence: list[VerificationEvidence] = []
         plan_history: list[TaskPlan] = []
@@ -446,6 +522,7 @@ class CodingAgent:
     def _complete_with_original_tests(
         self,
         *,
+        task: str,
         final_answer: str,
         snapshot: WorkspaceSnapshot,
         evidence: list[VerificationEvidence],
@@ -466,20 +543,56 @@ class CodingAgent:
                 messages,
             )
 
+        independent_review_available = False
+        if (
+            self.verifier_client is not None
+            and self._active_memory is not None
+            and bool(self._active_memory.modified_files)
+        ):
+            self.logger("[Independent verifier]")
+            review, review_error, fatal_error = self._request_verifier_review(
+                task=task, plans=plans, evidence=evidence
+            )
+            if fatal_error:
+                return self._fatal(
+                    fatal_error, evidence, plans, step_number, messages
+                )
+            if review is None:
+                self.logger("[Status] VERIFIER_FAILED")
+                return self._result(
+                    AgentStatus.VERIFIER_FAILED,
+                    final_answer.strip(),
+                    evidence,
+                    plans,
+                    step_number,
+                    messages,
+                    review_error or "Independent verifier produced no review.",
+                )
+            self._active_verifier_review = review
+            self.logger(f"[Verifier advice] {review.verdict.value}")
+            independent_review_available = True
+
         discovery = snapshot.discovery
         if not discovery.has_tests:
-            reason = discovery.error or (
-                "The initial workspace snapshot contained no collectable original tests."
-            )
-            self.logger("[Status] SELF_VERIFIED")
+            if not independent_review_available and self.verifier_client is not None:
+                self.logger("[Status] VERIFIER_FAILED")
+                return self._result(
+                    AgentStatus.VERIFIER_FAILED,
+                    final_answer.strip(),
+                    evidence,
+                    plans,
+                    step_number,
+                    messages,
+                    "Independent verification did not complete.",
+                )
+            self.logger("[Status] COMPLETED")
             return self._result(
-                AgentStatus.SELF_VERIFIED,
+                AgentStatus.COMPLETED,
                 final_answer.strip(),
                 evidence,
                 plans,
                 step_number,
                 messages,
-                reason,
             )
 
         self.logger("[Original test regression]")
@@ -538,14 +651,12 @@ class CodingAgent:
             return self._fatal(
                 "Task must be a non-empty string.", evidence, plan_history, 0, messages
             )
-        verification_required = task_requires_verification(task)
+        task_requests_verification = task_requires_verification(task)
         memory = self._active_memory or WorkingMemory.from_task(
-            task, verification_required=verification_required
+            task, verification_required=task_requests_verification
         )
         self._active_memory = memory
         workspace_revision = 0
-        last_verified_revision: int | None = None
-        verification_requests = 0
         plan_completion_reminders = 0
         replans = 0
 
@@ -568,7 +679,9 @@ class CodingAgent:
                 "role": "system",
                 "content": (
                     f"{PLANNING_PROMPT}\n\n"
-                    f"Task requires verification: {verification_required}.\n"
+                    f"Task text requests a likely code change: {task_requests_verification}.\n"
+                    "Builder-authored tests or verification commands are optional. The outer "
+                    "pipeline performs independent review and original-test regression.\n"
                     "Controlled workspace root inventory (names and types only):\n"
                     f"{inventory.output}"
                 ),
@@ -576,7 +689,9 @@ class CodingAgent:
             {"role": "user", "content": task},
         ])
         current_plan, planning_error, fatal_error = self._request_plan(
-            messages, revision=0, verification_required=verification_required
+            messages,
+            revision=0,
+            verification_required=task_requests_verification,
         )
         if fatal_error:
             return self._fatal(fatal_error, evidence, plan_history, 0, messages)
@@ -640,26 +755,8 @@ class CodingAgent:
                     })
                     continue
 
-                verified_current_revision = last_verified_revision == workspace_revision
-                if verification_required and not verified_current_revision:
-                    verification_requests += 1
-                    if verification_requests > self.max_verification_requests:
-                        self.logger("[Status] VERIFICATION_REQUIRED")
-                        return self._result(
-                            AgentStatus.VERIFICATION_REQUIRED, final_answer, evidence,
-                            plan_history, step_number, messages,
-                            "The current workspace revision has no successful verification evidence.",
-                        )
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            "The plan is complete, but the current workspace revision still requires "
-                            "successful verification. Use an allowed verification command."
-                        ),
-                    })
-                    continue
-
                 return self._complete_with_original_tests(
+                    task=task,
                     final_answer=final_answer,
                     snapshot=snapshot,
                     evidence=evidence,
@@ -667,10 +764,7 @@ class CodingAgent:
                     step_number=step_number,
                     workspace_revision=workspace_revision,
                     messages=messages,
-                    external_verification_required=(
-                        verification_required
-                        or any(item.tier is VerificationTier.SELF for item in evidence)
-                    ),
+                    external_verification_required=bool(memory.modified_files),
                 )
 
             parsed_calls: list[tuple[str, str, dict[str, Any] | None, str | None]] = []
@@ -734,7 +828,8 @@ class CodingAgent:
                 replans += 1
                 new_plan, planning_error, fatal_error = self._replan(
                     task=task, current_plan=current_plan, reason=reason,
-                    revision=replans, verification_required=verification_required,
+                    revision=self._next_plan_revision(plan_history),
+                    verification_required=False,
                     messages=messages,
                 )
                 if fatal_error:
@@ -762,10 +857,8 @@ class CodingAgent:
                 continue
 
             batch_blocked = False
-            failed_verification_reason: str | None = None
             for offset, (call_id, name, arguments, _error) in enumerate(parsed_calls):
                 planned_step = remaining[offset]
-                call_was_executed = not batch_blocked
                 if batch_blocked:
                     result = ToolResult(
                         False, error="Not executed because an earlier call in this batch failed."
@@ -786,35 +879,6 @@ class CodingAgent:
                 })
                 self.logger(f"[Tool result] success={result.success}")
 
-                command = (arguments or {}).get("command")
-                if (
-                    call_was_executed
-                    and name == "execute_command"
-                    and is_verification_command(command)
-                ):
-                    item = VerificationEvidence(
-                        tier=VerificationTier.SELF,
-                        step=step_number,
-                        command=" ".join(command),
-                        success=result.success,
-                        output=result.output,
-                        error=result.error,
-                        workspace_revision=workspace_revision,
-                    )
-                    evidence.append(item)
-                    memory.record_self_verification(
-                        " ".join(command), success=result.success
-                    )
-                    if result.success:
-                        last_verified_revision = workspace_revision
-                    self.logger(
-                        f"[Verification evidence] {' '.join(command)}: "
-                        f"{'passed' if result.success else 'failed'}"
-                    )
-                    if not result.success:
-                        failed_verification_reason = _verification_failure_reason(
-                            command, result
-                        )
                 if not result.success:
                     batch_blocked = True
                     continue
@@ -822,68 +886,18 @@ class CodingAgent:
                 planned_step.status = PlanStepStatus.COMPLETED
                 current_step_index += 1
                 plan_completion_reminders = 0
-                command = (arguments or {}).get("command")
                 if name == "read_file":
                     memory.record_read(
                         str((arguments or {}).get("path", "")),
                         purpose=planned_step.description,
                     )
                 if name == "write_file":
-                    verification_required = True
                     workspace_revision += 1
                     memory.record_write(
                         str((arguments or {}).get("path", "")),
                         workspace_revision=workspace_revision,
                     )
                 memory.complete_step(planned_step, current_plan)
-
-            if failed_verification_reason is not None and step_number < self.max_steps:
-                memory.add_issue(failed_verification_reason)
-                self.logger("[Verification failed] replanning recovery work")
-                if replans >= self.max_replans:
-                    return self._plan_failed(
-                        "The maximum number of replans was exceeded after verification failures.",
-                        evidence,
-                        plan_history,
-                        step_number,
-                        messages,
-                    )
-                replans += 1
-                new_plan, planning_error, fatal_error = self._replan(
-                    task=task,
-                    current_plan=current_plan,
-                    reason=failed_verification_reason,
-                    revision=replans,
-                    verification_required=True,
-                    messages=messages,
-                )
-                if fatal_error:
-                    return self._fatal(
-                        fatal_error, evidence, plan_history, step_number, messages
-                    )
-                if new_plan is None:
-                    return self._plan_failed(
-                        planning_error or "Unable to plan recovery from failed verification.",
-                        evidence,
-                        plan_history,
-                        step_number,
-                        messages,
-                    )
-                current_plan = new_plan
-                plan_history.append(current_plan)
-                memory.accept_plan(current_plan)
-                current_step_index = 0
-                plan_completion_reminders = 0
-                self._log_plan(current_plan, replan=True)
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        "Verification failed, so the revised recovery plan is accepted and "
-                        "mandatory. Execute its pending repair and verification steps in order:\n"
-                        f"{plan_as_json(current_plan)}"
-                    ),
-                })
-                continue
 
         self.logger("[Status] MAX_STEPS_REACHED")
         return self._result(

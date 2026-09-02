@@ -1,10 +1,10 @@
-"""Command-line entry point for the v0.6 coding agent."""
+"""Command-line entry point for the dual-model coding agent."""
 
 import argparse
 import json
 
 from agent import AgentResult, AgentStatus, CodingAgent
-from config import ConfigurationError
+from config import ConfigurationError, Settings
 from llm import LLMClient, LLMError
 
 
@@ -23,6 +23,20 @@ def print_result(result: AgentResult) -> None:
 
     if result.verification_level is not None:
         print(f"\n[Verification level] {result.verification_level.value}")
+
+    if result.verifier_review is not None:
+        review = result.verifier_review
+        print("\n[Independent Verifier Advice]")
+        print(f"Verdict: {review.verdict.value}")
+        print(f"Summary: {review.summary}")
+        if review.counterexamples:
+            print("Counterexamples:")
+            for item in review.counterexamples:
+                print(f"- {item}")
+        if review.unresolved_assumptions:
+            print("Unresolved assumptions:")
+            for item in review.unresolved_assumptions:
+                print(f"- {item}")
 
     if result.working_memory is not None:
         memory = result.working_memory
@@ -93,8 +107,13 @@ def main() -> int:
         return 0
 
     try:
-        client = LLMClient()
-        agent = CodingAgent(client)
+        settings = Settings.from_env()
+        builder_client = LLMClient(settings, model=settings.builder_model)
+        verifier_client = LLMClient(settings, model=settings.verifier_model)
+        agent = CodingAgent(
+            builder_client,
+            verifier_client=verifier_client,
+        )
     except (ConfigurationError, LLMError) as exc:
         print("[Status] FATAL_ERROR")
         print(f"[Reason] {exc}")

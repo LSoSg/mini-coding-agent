@@ -22,6 +22,7 @@ from planning import (
 )
 from tools import ToolResult
 from workspace_snapshot import OriginalTestDiscovery, OriginalTestRun
+from verifier import VerifierVerdict
 
 
 def planned_step(
@@ -65,6 +66,23 @@ def tool_response(*calls: dict[str, Any]) -> dict[str, Any]:
 
 def final_response(content: str = "Done.") -> dict[str, Any]:
     return {"role": "assistant", "content": content}
+
+
+def verifier_response(verdict: str = "PASS") -> str:
+    return json.dumps({
+        "verdict": verdict,
+        "summary": (
+            "Independent review passed."
+            if verdict == "PASS" else "The implementation has a counterexample."
+        ),
+        "requirement_checks": [{
+            "requirement": "The requested implementation is correct",
+            "satisfied": verdict == "PASS",
+            "reason": "Reviewed independently from Builder tests",
+        }],
+        "counterexamples": [] if verdict == "PASS" else ["Empty input fails"],
+        "unresolved_assumptions": [],
+    })
 
 
 class FakeLLM:
@@ -281,6 +299,119 @@ def test_write_revision_allows_a_needed_reread() -> None:
     assert result.working_memory.modified_files["a.py"].writes == 1
 
 
+def test_independent_verifier_uses_fresh_context_and_excludes_builder_tests() -> None:
+    steps = [
+        planned_step("source", "write_file", {"path": "feature.py"}),
+        planned_step("tests", "write_file", {"path": "test_feature.py"}),
+        planned_step("verify", "execute_command", {"command": ["pytest"]}),
+    ]
+    builder = FakeLLM([
+        plan_response(steps),
+        tool_response(tool_call(
+            "source", "write_file", {"path": "feature.py", "content": "def f(): return 1"}
+        )),
+        tool_response(tool_call(
+            "tests", "write_file", {"path": "test_feature.py", "content": "def test_f(): pass"}
+        )),
+        tool_response(tool_call("verify", "execute_command", {"command": ["pytest"]})),
+        final_response("Implemented."),
+    ])
+    verifier = FakeLLM([verifier_response()])
+    executor = FakeExecutor(results=[
+        ToolResult(True, "wrote source"),
+        ToolResult(True, "wrote tests"),
+        ToolResult(True, "1 passed"),
+        ToolResult(True, "def f(): return 1"),
+    ])
+
+    result = run_agent(
+        builder, executor, verifier_client=verifier
+    )("Implement feature.py and test it.")
+
+    assert result.status is AgentStatus.COMPLETED
+    assert result.verifier_review is not None
+    assert result.verifier_review.verdict is VerifierVerdict.PASS
+    assert len(verifier.calls) == 1
+    assert verifier.calls[0]["tools"] is None
+    verifier_messages = verifier.calls[0]["messages"]
+    assert [message["role"] for message in verifier_messages] == ["system", "user"]
+    context_text = verifier_messages[1]["content"]
+    assert "def f(): return 1" in context_text
+    assert "def test_f(): pass" not in context_text
+    assert all("tool_calls" not in message for message in verifier_messages)
+
+
+def test_verifier_failure_is_advice_and_does_not_block_original_regression() -> None:
+    steps = [
+        planned_step("source", "write_file", {"path": "feature.py"}),
+        planned_step("verify", "execute_command", {"command": ["pytest"]}),
+    ]
+    builder = FakeLLM([
+        plan_response(steps),
+        tool_response(tool_call(
+            "source", "write_file", {"path": "feature.py", "content": "def f(): return 0"}
+        )),
+        tool_response(tool_call("verify", "execute_command", {"command": ["pytest"]})),
+        final_response("Implemented."),
+    ])
+    verifier = FakeLLM([verifier_response("FAIL")])
+    executor = FakeExecutor(results=[
+        ToolResult(True, "wrote"),
+        ToolResult(True, "1 passed"),
+        ToolResult(True, "def f(): return 0"),
+    ])
+    snapshot = FakeSnapshot()
+
+    result = run_agent(
+        builder, executor, verifier_client=verifier, snapshot=snapshot
+    )("Implement feature.py.")
+
+    assert result.status is AgentStatus.COMPLETED
+    assert result.verifier_review is not None
+    assert result.verifier_review.counterexamples == ["Empty input fails"]
+    assert "run_original_tests" in snapshot.events
+
+
+def test_invalid_verifier_protocol_retries_then_returns_verifier_failed() -> None:
+    steps = [
+        planned_step("source", "write_file", {"path": "feature.py"}),
+        planned_step("verify", "execute_command", {"command": ["pytest"]}),
+    ]
+    builder = FakeLLM([
+        plan_response(steps),
+        tool_response(tool_call(
+            "source", "write_file", {"path": "feature.py", "content": "x = 1"}
+        )),
+        tool_response(tool_call("verify", "execute_command", {"command": ["pytest"]})),
+        final_response(),
+    ])
+    verifier = FakeLLM(["not-json", "still-not-json"])
+    executor = FakeExecutor(results=[
+        ToolResult(True, "wrote"),
+        ToolResult(True, "passed"),
+        ToolResult(True, "x = 1"),
+    ])
+
+    result = run_agent(
+        builder, executor, verifier_client=verifier
+    )("Implement feature.py.")
+
+    assert result.status is AgentStatus.VERIFIER_FAILED
+    assert len(verifier.calls) == 2
+
+
+def test_information_task_does_not_require_independent_code_verifier() -> None:
+    builder = FakeLLM([plan_response([]), final_response("An example project.")])
+    verifier = FakeLLM([])
+
+    result = run_agent(
+        builder, verifier_client=verifier
+    )("Explain this project.")
+
+    assert result.status is AgentStatus.COMPLETED
+    assert verifier.calls == []
+
+
 def test_inventory_failure_returns_plan_failed_without_llm_call() -> None:
     llm = FakeLLM([])
     executor = FakeExecutor(inventory=ToolResult(False, error="cannot list root"))
@@ -345,12 +476,77 @@ def test_legal_write_and_verification_plan_completes_in_order() -> None:
     assert result.verification_evidence[-1].workspace_revision == 1
     assert result.verification_level is VerificationTier.ORIGINAL
     assert [item.tier for item in result.verification_evidence] == [
-        VerificationTier.SELF,
         VerificationTier.ORIGINAL,
     ]
 
 
-def test_no_original_tests_returns_self_verified() -> None:
+def test_write_only_initial_plan_does_not_create_a_verification_plan() -> None:
+    initial = [planned_step("write", "write_file", {"path": "a.py"})]
+    llm = FakeLLM([
+        plan_response(initial),
+        tool_response(tool_call("write", "write_file", {
+            "path": "a.py", "content": "x = 1"
+        })),
+        final_response("Implemented."),
+    ])
+    verifier = FakeLLM([verifier_response()])
+    executor = FakeExecutor([
+        ToolResult(True, "wrote"),
+        ToolResult(True, "x = 1"),
+    ])
+    snapshot = FakeSnapshot(
+        discovery=OriginalTestDiscovery(available=True, test_files=())
+    )
+
+    result = run_agent(
+        llm,
+        executor,
+        verifier_client=verifier,
+        snapshot=snapshot,
+    )("Create a.py.")
+
+    assert result.status is AgentStatus.COMPLETED
+    assert [plan.revision for plan in result.plan_history] == [0]
+    assert [name for name, _arguments in executor.calls[1:]] == [
+        "write_file", "read_file"
+    ]
+    assert result.working_memory is not None
+    assert result.verifier_review is not None
+    assert [call["tools"] is None for call in llm.calls] == [True, False, False]
+
+
+def test_web_only_write_completes_after_independent_review() -> None:
+    initial = [planned_step("write", "write_file", {"path": "index.html"})]
+    builder = FakeLLM([
+        plan_response(initial),
+        tool_response(tool_call("write", "write_file", {
+            "path": "index.html", "content": "<canvas id='game'></canvas>"
+        })),
+        final_response("The game page is ready."),
+    ])
+    verifier = FakeLLM([verifier_response()])
+    executor = FakeExecutor([
+        ToolResult(True, "wrote"),
+        ToolResult(True, "<canvas id='game'></canvas>"),
+    ])
+    snapshot = FakeSnapshot(
+        discovery=OriginalTestDiscovery(available=True, test_files=())
+    )
+
+    result = run_agent(
+        builder,
+        executor,
+        verifier_client=verifier,
+        snapshot=snapshot,
+    )("设计一个网页版小游戏。")
+
+    assert result.status is AgentStatus.COMPLETED
+    assert result.working_memory is not None
+    assert result.working_memory.verification_state.value == "NOT_REQUIRED"
+    assert result.verifier_review is not None
+
+
+def test_optional_builder_test_does_not_become_completion_evidence() -> None:
     steps = [
         planned_step("write", "write_file", {"path": "a.py"}),
         planned_step("verify", "execute_command", {"command": ["pytest"]}),
@@ -371,8 +567,9 @@ def test_no_original_tests_returns_self_verified() -> None:
         snapshot=snapshot,
     )("Create a.py.")
 
-    assert result.status is AgentStatus.SELF_VERIFIED
-    assert result.verification_level is VerificationTier.SELF
+    assert result.status is AgentStatus.COMPLETED
+    assert result.verification_level is None
+    assert result.verification_evidence == []
     assert snapshot.events == ["capture", "cleanup"]
 
 
@@ -401,37 +598,35 @@ def test_original_test_failure_is_terminal_without_another_llm_call() -> None:
     )("Fix a.py.")
 
     assert result.status is AgentStatus.ORIGINAL_TESTS_FAILED
-    assert result.verification_level is VerificationTier.SELF
+    assert result.verification_level is None
     assert result.verification_evidence[-1].tier is VerificationTier.ORIGINAL
     assert result.verification_evidence[-1].success is False
     assert len(llm.calls) == 4
     assert snapshot.events == ["capture", "run_original_tests", "cleanup"]
 
 
-def test_original_collection_failure_degrades_to_self_verified() -> None:
+def test_original_collection_failure_can_complete_after_independent_review() -> None:
     snapshot = FakeSnapshot(discovery=OriginalTestDiscovery(
         available=False,
         error="Original test collection failed with exit code 2.",
     ))
-    steps = [
-        planned_step("write", "write_file", {"path": "a.py"}),
-        planned_step("verify", "execute_command", {"command": ["pytest"]}),
-    ]
+    steps = [planned_step("write", "write_file", {"path": "a.py"})]
     llm = FakeLLM([
         plan_response(steps),
         tool_response(tool_call("w", "write_file", {"path": "a.py", "content": "x"})),
-        tool_response(tool_call("v", "execute_command", {"command": ["pytest"]})),
         final_response(),
     ])
+    verifier = FakeLLM([verifier_response()])
 
     result = run_agent(
         llm,
-        FakeExecutor([ToolResult(True, "wrote"), ToolResult(True, "passed")]),
+        FakeExecutor([ToolResult(True, "wrote"), ToolResult(True, "x")]),
         snapshot=snapshot,
+        verifier_client=verifier,
     )("Create a.py.")
 
-    assert result.status is AgentStatus.SELF_VERIFIED
-    assert "collection failed" in (result.error or "")
+    assert result.status is AgentStatus.COMPLETED
+    assert result.verifier_review is not None
 
 
 def test_original_runner_protocol_failure_is_fatal() -> None:
@@ -668,14 +863,12 @@ def test_verification_before_write_becomes_stale_until_final_verification() -> N
     result = run_agent(llm, executor)("Fix a.py.")
 
     assert result.status is AgentStatus.COMPLETED
-    assert [
-        item.workspace_revision
-        for item in result.verification_evidence
-        if item.tier is VerificationTier.SELF
-    ] == [0, 1]
+    assert [item.tier for item in result.verification_evidence] == [
+        VerificationTier.ORIGINAL
+    ]
 
 
-def test_failed_verification_is_evidence_and_step_remains_pending() -> None:
+def test_failed_builder_command_is_not_verification_evidence() -> None:
     steps = [planned_step("verify", "execute_command", {"command": ["pytest"]})]
     llm = FakeLLM([
         plan_response(steps),
@@ -686,20 +879,14 @@ def test_failed_verification_is_evidence_and_step_remains_pending() -> None:
     result = run_agent(llm, executor, max_steps=1)("Run the tests.")
 
     assert result.status is AgentStatus.MAX_STEPS_REACHED
-    assert result.verification_evidence[0].success is False
+    assert result.verification_evidence == []
     assert result.plan_history[0].steps[0].status is PlanStepStatus.PENDING
 
 
-def test_failed_verification_replans_repairs_before_retry() -> None:
+def test_failed_optional_builder_command_retries_without_special_replan() -> None:
     initial = [
         planned_step("implementation", "write_file", {"path": "floyd.py"}),
-        planned_step("early_verify", "execute_command", {"command": ["pytest"]}),
-        planned_step("tests", "write_file", {"path": "test_floyd.py"}),
-        planned_step("final_verify", "execute_command", {"command": ["pytest"]}),
-    ]
-    recovery = [
-        planned_step("tests", "write_file", {"path": "test_floyd.py"}),
-        planned_step("verify", "execute_command", {"command": ["pytest"]}),
+        planned_step("optional_check", "execute_command", {"command": ["pytest"]}),
     ]
     llm = FakeLLM([
         plan_response(initial),
@@ -708,75 +895,24 @@ def test_failed_verification_replans_repairs_before_retry() -> None:
                 "path": "floyd.py", "content": "def floyd(): pass"
             }),
             tool_call("no-tests", "execute_command", {"command": ["pytest"]}),
-            tool_call("blocked-write", "write_file", {
-                "path": "test_floyd.py", "content": "def test_floyd(): pass"
-            }),
         ),
-        plan_response(recovery),
-        tool_response(
-            tool_call("write-tests", "write_file", {
-                "path": "test_floyd.py", "content": "def test_floyd(): pass"
-            }),
-            tool_call("passing-tests", "execute_command", {"command": ["pytest"]}),
-        ),
+        tool_response(tool_call("passing-tests", "execute_command", {"command": ["pytest"]})),
         final_response("Floyd is implemented and tested."),
     ])
     executor = FakeExecutor([
         ToolResult(True, "wrote source"),
         ToolResult(False, "collected 0 items", "exit status 5"),
-        ToolResult(True, "wrote tests"),
         ToolResult(True, "1 passed"),
     ])
 
     result = run_agent(llm, executor)("Write a Floyd algorithm.")
 
     assert result.status is AgentStatus.COMPLETED
-    assert [plan.revision for plan in result.plan_history] == [0, 1]
-    assert [
-        (item.success, item.output) for item in result.verification_evidence
-        if item.tier is VerificationTier.SELF
-    ] == [(False, "collected 0 items"), (True, "1 passed")]
+    assert [plan.revision for plan in result.plan_history] == [0]
+    assert result.verification_evidence[-1].tier is VerificationTier.ORIGINAL
     assert [name for name, _arguments in executor.calls[1:]] == [
-        "write_file", "execute_command", "write_file", "execute_command"
+        "write_file", "execute_command", "execute_command"
     ]
-    replanning_text = "\n".join(
-        str(message.get("content", ""))
-        for message in llm.calls[2]["messages"]
-        if message.get("role") == "system"
-    )
-    assert "pytest collected no tests (exit code 5)" in replanning_text
-    assert "test_*.py" in replanning_text
-    assert "floyd.py` will not make pytest collect it" in replanning_text
-
-
-def test_max_verification_requests_remains_bounded_as_defensive_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    injected_plan = TaskPlan(
-        goal="Injected runtime fallback scenario",
-        success_criteria=["Write completes"],
-        steps=[PlanStep(
-            id="write",
-            description="Write a file",
-            tool="write_file",
-            argument_constraints={"path": "a.py"},
-            rationale="Exercise post-plan verification fallback",
-        )],
-        revision=0,
-    )
-    monkeypatch.setattr("agent.parse_plan", lambda *args, **kwargs: injected_plan)
-    llm = FakeLLM([
-        plan_response([]),
-        tool_response(tool_call("w", "write_file", {"path": "a.py", "content": "x"})),
-        final_response(), final_response(),
-    ])
-    executor = FakeExecutor([ToolResult(True, "wrote")])
-
-    result = run_agent(llm, executor, max_verification_requests=1)(
-        "Perform the requested operation."
-    )
-
-    assert result.status is AgentStatus.VERIFICATION_REQUIRED
 
 
 def test_max_steps_and_fatal_errors_remain_distinct() -> None:

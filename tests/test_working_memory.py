@@ -24,6 +24,7 @@ def test_extracts_only_explicit_user_constraints() -> None:
 
 def test_tracks_plan_reads_writes_and_verification() -> None:
     memory = WorkingMemory.from_task("Modify a.py", verification_required=True)
+    assert memory.verification_state is MemoryVerificationState.NOT_REQUIRED
     step = PlanStep(
         id="read_a",
         description="Read the target module",
@@ -41,10 +42,7 @@ def test_tracks_plan_reads_writes_and_verification() -> None:
     memory.complete_step(step, plan)
     memory.record_write("a.py", workspace_revision=1)
     assert not memory.was_read_in_current_revision("a.py")
-    assert memory.verification_state is MemoryVerificationState.REQUIRED
-
-    memory.record_self_verification("python -m pytest", success=True)
-    assert memory.verification_state is MemoryVerificationState.SELF_PASSED
+    assert memory.verification_state is MemoryVerificationState.NOT_REQUIRED
 
 
 def test_memory_injection_does_not_mutate_or_hide_latest_observation() -> None:
